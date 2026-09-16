@@ -58,7 +58,19 @@ const WebSocket = require('ws');
 // ──────────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;          // Render/Glitch/Railway set PORT for you
 const HOST = process.env.HOST || '0.0.0.0';
-const HTML_FILE = path.join(__dirname, 'DealOrNoDeal_Offline_Hotspot.html');
+// Accept either filename so the game works whichever copy you dropped in.
+const HTML_CANDIDATES = [
+  'DealOrNoDeal.html',
+  'DealOrNoDeal_Offline_Hotspot.html',
+  'index.html',
+];
+const HTML_FILE = (function () {
+  for (const name of HTML_CANDIDATES) {
+    const p = path.join(__dirname, name);
+    if (fs.existsSync(p)) return p;
+  }
+  return path.join(__dirname, HTML_CANDIDATES[0]);
+})();
 
 function getLocalIP() {
   const interfaces = os.networkInterfaces();
@@ -120,7 +132,7 @@ const server = http.createServer((req, res) => {
       fs.readFile(HTML_FILE, (err2, data2) => {
         if (err2) {
           res.writeHead(500, { 'Content-Type': 'text/plain' });
-          res.end('Error loading game. Is DealOrNoDeal_Offline_Hotspot.html in this folder?');
+          res.end('Error loading game. Put DealOrNoDeal.html in the same folder as server.js.');
           return;
         }
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
@@ -147,11 +159,20 @@ function roomInfo(room) {
   return {
     groups: Array.from(room.groups.values()).map(g => ({
       name: g.name,
+      members: g.members || [],
       status: g.status,
       errors: g.errors || 0,
       dealValue: g.dealValue || null,
       finalValue: g.finalValue || null,
+      caseValue: g.caseValue || null,
       pts: g.pts || null,
+      // live gameplay progress
+      opened: g.opened || 0,
+      totalCases: g.totalCases || 0,
+      round: g.round || 0,
+      offer: g.offer || null,
+      // focus / tab-leave alerts
+      alerts: g.alerts || 0,
     })),
   };
 }
@@ -236,11 +257,18 @@ wss.on('connection', (ws, req) => {
         room.groups.set(groupId, {
           ws,
           name: groupName,
+          members: Array.isArray(msg.members) ? msg.members.slice(0, 20).map(m => String(m).slice(0, 40)) : [],
           status: 'playing',
           errors: 0,
           dealValue: null,
           finalValue: null,
+          caseValue: null,
           pts: null,
+          opened: 0,
+          totalCases: 0,
+          round: 0,
+          offer: null,
+          alerts: 0,
         });
 
         boundRoomId = roomId;
@@ -266,8 +294,17 @@ wss.on('connection', (ws, req) => {
         if (msg.status !== undefined) g.status = msg.status;
         if (msg.dealValue !== undefined) g.dealValue = msg.dealValue;
         if (msg.finalValue !== undefined) g.finalValue = msg.finalValue;
+        if (msg.caseValue !== undefined) g.caseValue = msg.caseValue;
         if (msg.pts !== undefined) g.pts = msg.pts;
         if (msg.errors !== undefined) g.errors = msg.errors;
+        // live progress
+        if (msg.opened !== undefined) g.opened = msg.opened;
+        if (msg.totalCases !== undefined) g.totalCases = msg.totalCases;
+        if (msg.round !== undefined) g.round = msg.round;
+        if (msg.offer !== undefined) g.offer = msg.offer;
+        if (Array.isArray(msg.members) && msg.members.length) {
+          g.members = msg.members.slice(0, 20).map(m => String(m).slice(0, 40));
+        }
 
         notifyHost(room, { type: 'group_update', info: roomInfo(room) });
         break;
@@ -277,10 +314,40 @@ wss.on('connection', (ws, req) => {
       case 'host_broadcast': {
         const room = rooms.get(boundRoomId);
         if (!room || !isHost) return;
+
+        // If a target group name is given, send only to that group
+        const target = msg.target ? String(msg.target) : null;
+        let sent = 0;
         for (const g of room.groups.values()) {
+          if (target && g.name !== target) continue;
           sendTo(g.ws, { type: 'host_message', payload: msg.payload });
+          sent++;
         }
-        console.log(`[ROOM] "${boundRoomId}" host broadcast:`, msg.payload);
+        console.log(`[ROOM] "${boundRoomId}" host broadcast -> ${target || 'all'} (${sent}):`, msg.payload && msg.payload.cmd);
+        break;
+      }
+
+      // ── A group reports it lost focus / left the tab ───────────────────
+      case 'group_alert': {
+        const room = rooms.get(boundRoomId);
+        if (!room) return;
+        const g = room.groups.get(boundGroupId || msg.groupId);
+        if (!g) return;
+
+        g.alerts = (g.alerts || 0) + 1;
+
+        console.log(`[ALERT] "${g.name}" left the tab (${g.alerts}x) in room "${boundRoomId}"`);
+
+        // Tell the teacher right away
+        notifyHost(room, {
+          type: 'group_alert',
+          groupName: g.name,
+          alertType: msg.alertType || 'tab_leave',
+          count: g.alerts,
+          at: msg.at || '',
+        });
+        // Refresh the dashboard counters too
+        notifyHost(room, { type: 'group_update', info: roomInfo(room) });
         break;
       }
 
