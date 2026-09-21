@@ -1,12 +1,13 @@
 {
   "name": "deal-or-no-deal-academic-edition",
-  "version": "1.0.0",
-  "description": "Deal or No Deal – Academic Edition | Interactive classroom game with WebSocket multiplayer support",
+  "version": "3.1.0",
+  "description": "Deal or No Deal – Academic Edition | Interactive classroom game with unified WebSocket multiplayer support for both online and offline (LAN/Hotspot) modes",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js",
-    "help": "echo 'Usage: npm start'"
+    "help": "echo 'Usage: npm start'",
+    "check": "node -v && npm -v"
   },
   "keywords": [
     "game",
@@ -15,12 +16,21 @@
     "deal-or-no-deal",
     "quiz",
     "multiplayer",
-    "websocket"
+    "websocket",
+    "nodejs",
+    "grouping",
+    "scoring",
+    "leaderboard",
+    "offline",
+    "online",
+    "lan",
+    "hotspot"
   ],
   "author": "Jodel",
   "license": "PROPRIETARY",
   "engines": {
-    "node": ">=14.0.0"
+    "node": ">=14.0.0",
+    "npm": ">=6.0.0"
   },
   "dependencies": {
     "ws": "^8.14.0"
@@ -29,5 +39,14 @@
   "repository": {
     "type": "git",
     "url": "https://github.com/your-username/deal-or-no-deal-academic"
-  }
+  },
+  "homepage": "https://github.com/your-username/deal-or-no-deal-academic#readme",
+  "bugs": {
+    "url": "https://github.com/your-username/deal-or-no-deal-academic/issues"
+  },
+  "engines": {
+    "node": ">=14.0.0",
+    "npm": ">=6.0.0"
+  },
+  "readme": "README.md"
 }

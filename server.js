@@ -6,43 +6,48 @@
  *
  * AUTHOR: Jodel
  *
- * WHY THIS FILE REPLACES YOUR OLD server.js:
+ * v3 — GROUPS NOW WORK LIKE A CLASS
  * ----------------------------------------------------------------------------
- * Your game's built-in multiplayer engine (search the HTML for "MULTIPLAYER
- * ENGINE") sends these WebSocket messages:
+ *  • A GROUP is a class (e.g. "Grade 9 – Rizal"). It is saved in the database.
+ *  • Every student joins on their OWN device, types the room code, then types
+ *    their NAME. Each student plays their own game and gets their own score.
+ *  • Each time the teacher generates a code they choose:
+ *        – create a NEW group, or
+ *        – use an EXISTING group (the code is simply added to that group).
+ *  • Students and every finished game are written to  dond-database.json
+ *    (in the same folder as this file).
  *
- *      host_create      { roomId }
- *      group_join       { roomId, groupId, groupName }
- *      group_update     { roomId, groupId, status, dealValue, finalValue, pts, errors }
- *      host_broadcast   { payload }
- *
- * ...and expects these back:
- *
- *      host_created         { roomId, info }
- *      group_joined         { groupId, groupName, info }   (to the joiner)
- *      group_joined/update  { info }                        (to the host, to refresh dashboard)
- *      group_disconnected   { info }
- *      host_message         { payload }
- *      error                { msg }
- *
- * Your OLD server.js only understood join_room / sync_request — messages the
- * game never sends. So the WebSocket connected fine, but the moment the game
- * asked to create/join a room, the server had nothing to say back. The screen
- * just sat on "Creating room…" / "Joining room…" forever. That was the bug.
- *
- * THIS server speaks the game's actual protocol, so Create/Join now work.
- *
+ * WEBSOCKET PROTOCOL
  * ----------------------------------------------------------------------------
- * ONE FILE, TWO MODES — NO CODE CHANGES NEEDED BETWEEN THEM:
- * ----------------------------------------------------------------------------
- * OFFLINE (hotspot/LAN):  node server.js  → open the printed http://IP:3000
- * ONLINE  (internet):     deploy this exact file to a free host (Render,
- *                          Glitch, Railway, etc). The game auto-detects
- *                          "wss://" + the page's own domain, so the SAME
- *                          HTML works unmodified in both places.
+ *  Teacher → server
+ *    host_create   { roomId, groupMode:'new'|'existing', groupName?, groupId? }
+ *    host_broadcast{ payload, targetId? }           (targetId = one student)
+ *    host_end      {}                               (close the room now)
  *
- * See DEPLOY_ONLINE_FREE.md for the free-hosting walkthrough with a
- * copy-paste live link.
+ *  Student → server
+ *    room_check    { roomId }                        (step 1: is the code valid?)
+ *    player_join   { roomId, playerName, inGame? }   (step 2: my name)
+ *    player_update { status, opened, totalCases, round, errors, offer, ... }
+ *    player_result { gameId, caseVal, deal, final, pts, ptsNum, errors, winner }
+ *    player_alert  { alertType, at }
+ *
+ *  Server → teacher
+ *    host_created  { roomId, group, info }
+ *    room_info     { info }                          (any change in the room)
+ *    player_alert  { playerId, playerName, count, at }
+ *    error         { code, msg }
+ *
+ *  Server → student
+ *    room_ok       { roomId, groupName }
+ *    player_joined { playerId, playerName, groupName, roomId }
+ *    host_message  { payload }
+ *    error         { code, msg }
+ *
+ *  HTTP (database)
+ *    GET  /api/db                 → whole database (groups, players, results)
+ *    GET  /api/groups             → list of groups (for the "existing group" picker)
+ *    POST /api/groups/delete      { id }  → delete one group
+ *    POST /api/db/clear           → delete every group
  * ============================================================================
  */
 
@@ -56,14 +61,12 @@ const WebSocket = require('ws');
 // ──────────────────────────────────────────────────────────────────────────
 // CONFIG
 // ──────────────────────────────────────────────────────────────────────────
-const PORT = process.env.PORT || 3000;          // Render/Glitch/Railway set PORT for you
+const PORT = process.env.PORT || 3000;
 const HOST = process.env.HOST || '0.0.0.0';
-// Accept either filename so the game works whichever copy you dropped in.
-const HTML_CANDIDATES = [
-  'DealOrNoDeal.html',
-  'DealOrNoDeal_Offline_Hotspot.html',
-  'index.html',
-];
+const DB_FILE = process.env.DOND_DB || path.join(__dirname, 'dond-database.json');
+const HOST_GRACE_MS = 20000;   // teacher Wi-Fi blip: keep the room alive this long
+
+const HTML_CANDIDATES = ['DealOrNoDeal.html', 'DealOrNoDeal_Offline_Hotspot.html', 'index.html'];
 const HTML_FILE = (function () {
   for (const name of HTML_CANDIDATES) {
     const p = path.join(__dirname, name);
@@ -84,20 +87,144 @@ function getLocalIP() {
 const localIP = getLocalIP();
 
 const MIME_TYPES = {
-  '.html': 'text/html; charset=utf-8',
-  '.js': 'application/javascript',
-  '.css': 'text/css',
-  '.json': 'application/json',
-  '.png': 'image/png',
-  '.jpg': 'image/jpeg',
-  '.jpeg': 'image/jpeg',
-  '.svg': 'image/svg+xml',
-  '.ico': 'image/x-icon',
+  '.html': 'text/html; charset=utf-8', '.js': 'application/javascript', '.css': 'text/css',
+  '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+  '.svg': 'image/svg+xml', '.ico': 'image/x-icon',
 };
 
 // ──────────────────────────────────────────────────────────────────────────
-// HTTP SERVER (serves the game; also a tiny health/status API)
+// DATABASE  (a single JSON file — no extra installs needed)
 // ──────────────────────────────────────────────────────────────────────────
+// {
+//   version: 3,
+//   groups: {
+//     [groupId]: {
+//       id, name, createdAt,
+//       codes:   [ { code, createdAt } ],
+//       players: { [nameKey]: { name, firstJoined, lastJoined } },
+//       results: [ { gameId, roomCode, playerName, datetime, caseVal, deal,
+//                    final, pts, ptsNum, errors, winner, alerts } ]
+//     }
+//   }
+// }
+let db = { version: 3, groups: {} };
+
+function loadDb() {
+  try {
+    if (fs.existsSync(DB_FILE)) {
+      const parsed = JSON.parse(fs.readFileSync(DB_FILE, 'utf8'));
+      if (parsed && parsed.groups && typeof parsed.groups === 'object') db = parsed;
+    }
+  } catch (e) {
+    console.error('[DB] could not read database, starting empty:', e.message);
+    try { fs.copyFileSync(DB_FILE, DB_FILE + '.broken-' + Date.now()); } catch (_) {}
+  }
+}
+
+let saveTimer = null;
+function saveDb() {
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(saveDbNow, 300);
+}
+function saveDbNow() {
+  clearTimeout(saveTimer);
+  try {
+    const tmp = DB_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(db, null, 2));
+    fs.renameSync(tmp, DB_FILE);
+  } catch (e) {
+    console.error('[DB] save failed:', e.message);
+  }
+}
+
+const nameKey = (s) => String(s || '').trim().replace(/\s+/g, ' ').toLowerCase();
+const cleanName = (s, max) => String(s || '').trim().replace(/\s+/g, ' ').slice(0, max || 40);
+const genId = (prefix) => prefix + Math.random().toString(36).slice(2, 10) + Date.now().toString(36).slice(-3);
+
+function findGroupByName(name) {
+  const k = nameKey(name);
+  return Object.values(db.groups).find(g => nameKey(g.name) === k) || null;
+}
+
+function groupSummary(g) {
+  const lastCode = g.codes && g.codes.length ? g.codes[g.codes.length - 1] : null;
+  return {
+    id: g.id,
+    name: g.name,
+    createdAt: g.createdAt,
+    playerCount: Object.keys(g.players || {}).length,
+    gameCount: (g.results || []).length,
+    codeCount: (g.codes || []).length,
+    lastCode: lastCode ? lastCode.code : null,
+    lastUsed: lastCode ? lastCode.createdAt : g.createdAt,
+  };
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// ROOMS (live sessions, in memory)
+// ──────────────────────────────────────────────────────────────────────────
+const rooms = new Map();
+
+function roomInfo(room) {
+  const g = db.groups[room.groupId];
+  return {
+    roomId: room.roomId,
+    groupId: room.groupId,
+    groupName: g ? g.name : '',
+    rosterCount: g ? Object.keys(g.players).length : 0,
+    started: !!room.started,
+    players: Array.from(room.players.values()).map(p => ({
+      id: p.id,
+      name: p.name,
+      status: p.status,
+      errors: p.errors || 0,
+      opened: p.opened || 0,
+      totalCases: p.totalCases || 0,
+      round: p.round || 0,
+      offer: p.offer || null,
+      dealValue: p.dealValue || null,
+      finalValue: p.finalValue || null,
+      caseValue: p.caseValue || null,
+      pts: p.pts || null,
+      ptsNum: typeof p.ptsNum === 'number' ? p.ptsNum : null,
+      winner: p.winner || null,
+      alerts: p.alerts || 0,
+      gamesDone: p.gamesDone || 0,
+    })),
+  };
+}
+
+function sendTo(ws, msg) {
+  if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
+}
+function notifyHost(room, msg) { if (room && room.hostWs) sendTo(room.hostWs, msg); }
+function pushInfo(room) { notifyHost(room, { type: 'room_info', info: roomInfo(room) }); }
+
+function closeRoom(roomId, reason) {
+  const room = rooms.get(roomId);
+  if (!room) return;
+  clearTimeout(room.hostTimer);
+  for (const p of room.players.values()) {
+    sendTo(p.ws, { type: 'error', code: 'room_closed', msg: reason || 'The teacher ended the session.' });
+  }
+  notifyHost(room, { type: 'error', code: 'room_closed', msg: reason || 'The room was closed.' });
+  rooms.delete(roomId);
+  console.log(`[ROOM] "${roomId}" closed`);
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// HTTP SERVER
+// ──────────────────────────────────────────────────────────────────────────
+function sendJson(res, code, obj) {
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+  res.end(JSON.stringify(obj));
+}
+function readBody(req, cb) {
+  let data = '';
+  req.on('data', c => { data += c; if (data.length > 1e5) req.destroy(); });
+  req.on('end', () => { try { cb(JSON.parse(data || '{}')); } catch (e) { cb({}); } });
+}
+
 const server = http.createServer((req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
@@ -106,29 +233,43 @@ const server = http.createServer((req, res) => {
   let pathname = parsedUrl.pathname;
 
   if (pathname === '/health' || pathname === '/api/status') {
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({
-      status: 'online',
-      rooms: rooms.size,
-      localIP,
-      port: PORT,
-      time: new Date().toISOString(),
-    }));
-    return;
+    return sendJson(res, 200, { status: 'online', rooms: rooms.size, groups: Object.keys(db.groups).length, localIP, port: PORT, time: new Date().toISOString() });
+  }
+  if (pathname === '/api/db' && req.method === 'GET') {
+    return sendJson(res, 200, db);
+  }
+  if (pathname === '/api/groups' && req.method === 'GET') {
+    const list = Object.values(db.groups).map(groupSummary)
+      .sort((a, b) => String(b.lastUsed).localeCompare(String(a.lastUsed)));
+    return sendJson(res, 200, { groups: list });
+  }
+  if (pathname === '/api/groups/delete' && req.method === 'POST') {
+    return readBody(req, body => {
+      const id = String(body.id || '');
+      if (!db.groups[id]) return sendJson(res, 404, { ok: false, msg: 'Group not found.' });
+      for (const [rid, room] of Array.from(rooms)) if (room.groupId === id) closeRoom(rid, 'This group was deleted by the teacher.');
+      delete db.groups[id];
+      saveDbNow();
+      sendJson(res, 200, { ok: true });
+    });
+  }
+  if (pathname === '/api/db/clear' && req.method === 'POST') {
+    for (const rid of Array.from(rooms.keys())) closeRoom(rid, 'All group records were cleared by the teacher.');
+    db = { version: 3, groups: {} };
+    saveDbNow();
+    return sendJson(res, 200, { ok: true });
   }
 
   if (pathname === '/' || pathname === '') pathname = '/index.html';
 
-  const filePath = pathname === '/index.html'
-    ? HTML_FILE
-    : path.join(__dirname, pathname);
-
-  const ext = path.extname(filePath).toLowerCase();
-  const mimeType = MIME_TYPES[ext] || 'application/octet-stream';
+  // Only the game page and plain assets are served — never the database or server files.
+  const ext = path.extname(pathname).toLowerCase();
+  const safeName = path.basename(pathname);
+  const isAsset = MIME_TYPES[ext] && !/^(server\.js|package\.json)$/i.test(safeName) && ext !== '.json';
+  const filePath = (pathname === '/index.html' || !isAsset) ? HTML_FILE : path.join(__dirname, safeName);
 
   fs.readFile(filePath, (err, data) => {
     if (err) {
-      // SPA fallback → always serve the game itself
       fs.readFile(HTML_FILE, (err2, data2) => {
         if (err2) {
           res.writeHead(500, { 'Content-Type': 'text/plain' });
@@ -140,214 +281,245 @@ const server = http.createServer((req, res) => {
       });
       return;
     }
-    res.writeHead(200, { 'Content-Type': mimeType });
+    res.writeHead(200, { 'Content-Type': MIME_TYPES[path.extname(filePath).toLowerCase()] || 'text/html; charset=utf-8' });
     res.end(data);
   });
 });
 
 // ──────────────────────────────────────────────────────────────────────────
-// ROOM STATE  (in-memory — resets if the server restarts, which is what
-// makes "close server → link/room dies immediately" work for free)
-// ──────────────────────────────────────────────────────────────────────────
-// rooms: roomId -> {
-//   hostWs,
-//   groups: Map<groupId, { ws, name, status, errors, dealValue, finalValue, pts }>
-// }
-const rooms = new Map();
-
-function roomInfo(room) {
-  return {
-    groups: Array.from(room.groups.values()).map(g => ({
-      name: g.name,
-      members: g.members || [],
-      status: g.status,
-      errors: g.errors || 0,
-      dealValue: g.dealValue || null,
-      finalValue: g.finalValue || null,
-      caseValue: g.caseValue || null,
-      pts: g.pts || null,
-      // live gameplay progress
-      opened: g.opened || 0,
-      totalCases: g.totalCases || 0,
-      round: g.round || 0,
-      offer: g.offer || null,
-      // focus / tab-leave alerts
-      alerts: g.alerts || 0,
-    })),
-  };
-}
-
-function sendTo(ws, msg) {
-  if (ws && ws.readyState === WebSocket.OPEN) {
-    ws.send(JSON.stringify(msg));
-  }
-}
-
-function notifyHost(room, msg) {
-  if (room && room.hostWs) sendTo(room.hostWs, msg);
-}
-
-function genGroupId() {
-  return 'g_' + Math.random().toString(36).slice(2, 10);
-}
-
-// ──────────────────────────────────────────────────────────────────────────
-// WEBSOCKET SERVER — speaks the game's exact protocol
+// WEBSOCKET SERVER
 // ──────────────────────────────────────────────────────────────────────────
 const wss = new WebSocket.Server({ server });
 
 wss.on('connection', (ws, req) => {
-  const clientIP = req.socket.remoteAddress;
-  console.log(`[WS] connection from ${clientIP}`);
+  console.log(`[WS] connection from ${req.socket.remoteAddress}`);
 
-  // Track what this socket is, so we can clean up correctly on close
   let boundRoomId = null;
-  let boundGroupId = null;
+  let boundPlayerId = null;
   let isHost = false;
+
+  const err = (code, msg) => sendTo(ws, { type: 'error', code, msg });
 
   ws.on('message', (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(raw);
-    } catch (e) {
-      sendTo(ws, { type: 'error', msg: 'Malformed message.' });
-      return;
-    }
+    try { msg = JSON.parse(raw); } catch (e) { return err('bad_message', 'Malformed message.'); }
 
     switch (msg.type) {
 
-      // ── Host creates a room ────────────────────────────────────────────
+      // ── Teacher creates (or re-attaches to) a room ─────────────────────
       case 'host_create': {
-        const roomId = String(msg.roomId || 'ROOM1').toUpperCase();
+        const roomId = cleanName(msg.roomId, 8).toUpperCase();
+        if (!/^[A-Z0-9]{3,8}$/.test(roomId)) return err('bad_code', 'Room code must be 3–8 letters or numbers.');
 
-        if (rooms.has(roomId)) {
-          // Reuse if the same host reconnects; otherwise block duplicate host
-          const existing = rooms.get(roomId);
-          if (existing.hostWs && existing.hostWs.readyState === WebSocket.OPEN && existing.hostWs !== ws) {
-            sendTo(ws, { type: 'error', msg: `Room "${roomId}" already has an active host. Choose a different Room ID.` });
-            return;
-          }
-        }
-
-        const room = rooms.get(roomId) || { hostWs: null, groups: new Map() };
-        room.hostWs = ws;
-        rooms.set(roomId, room);
-
-        boundRoomId = roomId;
-        isHost = true;
-
-        console.log(`[ROOM] "${roomId}" created/hosted`);
-        sendTo(ws, { type: 'host_created', roomId, info: roomInfo(room) });
-        break;
-      }
-
-      // ── A group joins a room ───────────────────────────────────────────
-      case 'group_join': {
-        const roomId = String(msg.roomId || 'ROOM1').toUpperCase();
-        const room = rooms.get(roomId);
-
-        if (!room) {
-          sendTo(ws, { type: 'error', msg: `Room "${roomId}" not found. Ask your host for the correct Room ID, and make sure they clicked "CREATE ROOM" first.` });
+        const existingRoom = rooms.get(roomId);
+        if (existingRoom) {
+          const hostAlive = existingRoom.hostWs && existingRoom.hostWs.readyState === WebSocket.OPEN && existingRoom.hostWs !== ws;
+          if (hostAlive || !msg.reattach) return err('code_in_use', `Room code "${roomId}" is already in use. Generate a new code.`);
+          // Teacher reconnecting after a Wi-Fi blip → reattach
+          clearTimeout(existingRoom.hostTimer);
+          existingRoom.hostWs = ws;
+          boundRoomId = roomId; isHost = true;
+          const g = db.groups[existingRoom.groupId];
+          console.log(`[ROOM] host re-attached to "${roomId}"`);
+          sendTo(ws, { type: 'host_created', roomId, group: g ? groupSummary(g) : null, info: roomInfo(existingRoom), reattached: true });
           return;
         }
+        if (msg.reattach) return err('room_closed', 'The room closed while you were disconnected. Create a new room.');
 
-        const groupId = genGroupId();
-        const groupName = String(msg.groupName || 'Group').slice(0, 40);
+        // Resolve the group
+        let group = null;
+        if (msg.groupMode === 'existing') {
+          group = db.groups[String(msg.groupId || '')];
+          if (!group) return err('group_missing', 'That group no longer exists. Pick another group or create a new one.');
+        } else {
+          const name = cleanName(msg.groupName, 60);
+          if (!name) return err('group_name', 'Type a name for the new group (e.g. "Grade 9 – Rizal").');
+          if (findGroupByName(name)) return err('group_exists', `A group named "${name}" already exists. Choose it under USE EXISTING GROUP, or type a different name.`);
+          const id = genId('grp_');
+          group = db.groups[id] = { id, name, createdAt: new Date().toISOString(), codes: [], players: {}, results: [] };
+          console.log(`[DB] new group "${name}"`);
+        }
+        group.codes.push({ code: roomId, createdAt: new Date().toISOString() });
+        saveDb();
 
-        room.groups.set(groupId, {
-          ws,
-          name: groupName,
-          members: Array.isArray(msg.members) ? msg.members.slice(0, 20).map(m => String(m).slice(0, 40)) : [],
-          status: 'playing',
-          errors: 0,
-          dealValue: null,
-          finalValue: null,
-          caseValue: null,
-          pts: null,
-          opened: 0,
-          totalCases: 0,
-          round: 0,
-          offer: null,
-          alerts: 0,
-        });
+        const room = { roomId, groupId: group.id, hostWs: ws, hostTimer: null, started: false, startPayload: null, kicked: new Set(), players: new Map() };
+        rooms.set(roomId, room);
+        boundRoomId = roomId; isHost = true;
 
-        boundRoomId = roomId;
-        boundGroupId = groupId;
-
-        console.log(`[ROOM] "${groupName}" joined "${roomId}"`);
-
-        // Tell the joining group who they are
-        sendTo(ws, { type: 'group_joined', groupId, groupName, info: roomInfo(room) });
-
-        // Refresh the host's dashboard
-        notifyHost(room, { type: 'group_joined', info: roomInfo(room) });
+        console.log(`[ROOM] "${roomId}" opened for group "${group.name}"`);
+        sendTo(ws, { type: 'host_created', roomId, group: groupSummary(group), info: roomInfo(room) });
         break;
       }
 
-      // ── A group reports a status/score update ──────────────────────────
-      case 'group_update': {
-        const room = rooms.get(boundRoomId);
-        if (!room) return;
-        const g = room.groups.get(boundGroupId || msg.groupId);
-        if (!g) return;
+      // ── Student step 1: check the code ─────────────────────────────────
+      case 'room_check': {
+        const roomId = cleanName(msg.roomId, 8).toUpperCase();
+        const room = rooms.get(roomId);
+        if (!room) return err('room_not_found', `Room code "${roomId}" was not found. Check the code with your teacher.`);
+        const g = db.groups[room.groupId];
+        sendTo(ws, { type: 'room_ok', roomId, groupName: g ? g.name : '' });
+        break;
+      }
 
-        if (msg.status !== undefined) g.status = msg.status;
-        if (msg.dealValue !== undefined) g.dealValue = msg.dealValue;
-        if (msg.finalValue !== undefined) g.finalValue = msg.finalValue;
-        if (msg.caseValue !== undefined) g.caseValue = msg.caseValue;
-        if (msg.pts !== undefined) g.pts = msg.pts;
-        if (msg.errors !== undefined) g.errors = msg.errors;
-        // live progress
-        if (msg.opened !== undefined) g.opened = msg.opened;
-        if (msg.totalCases !== undefined) g.totalCases = msg.totalCases;
-        if (msg.round !== undefined) g.round = msg.round;
-        if (msg.offer !== undefined) g.offer = msg.offer;
-        if (Array.isArray(msg.members) && msg.members.length) {
-          g.members = msg.members.slice(0, 20).map(m => String(m).slice(0, 40));
+      // ── Student step 2: join with a name ───────────────────────────────
+      case 'player_join': {
+        const roomId = cleanName(msg.roomId, 8).toUpperCase();
+        const room = rooms.get(roomId);
+        if (!room) return err('room_not_found', `Room code "${roomId}" was not found. Check the code with your teacher.`);
+        const group = db.groups[room.groupId];
+        if (!group) return err('group_missing', 'This group no longer exists.');
+
+        const name = cleanName(msg.playerName, 40);
+        if (name.length < 2) return err('name_short', 'Please type your name (at least 2 letters).');
+        const key = nameKey(name);
+        if (room.kicked.has(key)) return err('kicked', 'You were removed from this room by your teacher.');
+
+        // Same name already in this room?
+        let player = Array.from(room.players.values()).find(p => p.key === key);
+        if (player && player.ws && player.ws.readyState === WebSocket.OPEN && player.ws !== ws) {
+          return err('name_taken', `"${name}" is already playing in this room. If that isn't you, add your surname or last initial.`);
         }
 
-        notifyHost(room, { type: 'group_update', info: roomInfo(room) });
+        if (player) {
+          player.ws = ws;                       // reconnecting student
+          if (player.status === 'disconnected') player.status = msg.inGame ? 'playing' : 'waiting';
+        } else {
+          player = {
+            id: genId('p_'), ws, name, key, status: 'waiting',
+            errors: 0, opened: 0, totalCases: 0, round: 0, offer: null,
+            dealValue: null, finalValue: null, caseValue: null, pts: null, ptsNum: null, winner: null,
+            alerts: 0, gamesDone: 0,
+          };
+          room.players.set(player.id, player);
+        }
+
+        // Add the student to the group in the database
+        const now = new Date().toISOString();
+        if (!group.players[key]) group.players[key] = { name, firstJoined: now, lastJoined: now };
+        else { group.players[key].lastJoined = now; group.players[key].name = name; }
+        saveDb();
+
+        boundRoomId = roomId;
+        boundPlayerId = player.id;
+
+        console.log(`[ROOM] "${name}" joined "${roomId}" (${group.name})`);
+        sendTo(ws, { type: 'player_joined', playerId: player.id, playerName: player.name, groupName: group.name, roomId, started: !!room.started });
+
+        // Late joiner: the teacher already pressed START → start them too
+        if (room.started && room.startPayload && !msg.inGame && player.status !== 'done') {
+          sendTo(ws, { type: 'host_message', payload: room.startPayload });
+        }
+        pushInfo(room);
         break;
       }
 
-      // ── Host broadcasts a command (e.g. start_game) to all groups ──────
+      // ── Student live progress ─────────────────────────────────────────
+      case 'player_update': {
+        const room = rooms.get(boundRoomId);
+        if (!room) return;
+        const p = room.players.get(boundPlayerId);
+        if (!p) return;
+        if (msg.newGame) {
+          // A fresh game started → clear the previous result on the card
+          p.finalValue = null; p.caseValue = null; p.pts = null; p.ptsNum = null; p.winner = null; p.dealValue = null; p.offer = null;
+        }
+        for (const f of ['status', 'errors', 'opened', 'totalCases', 'round', 'offer', 'dealValue']) {
+          if (msg[f] !== undefined) p[f] = msg[f];
+        }
+        pushInfo(room);
+        break;
+      }
+
+      // ── Student finished a game → save the score ───────────────────────
+      case 'player_result': {
+        const room = rooms.get(boundRoomId);
+        if (!room) return;
+        const p = room.players.get(boundPlayerId);
+        if (!p) return;
+        const group = db.groups[room.groupId];
+
+        const gameId = cleanName(msg.gameId, 40) || genId('game_');
+        p.status = 'done';
+        p.finalValue = msg.final || null;
+        p.caseValue = msg.caseVal || null;
+        p.dealValue = msg.deal || null;
+        p.pts = msg.pts || null;
+        p.ptsNum = Number(msg.ptsNum) || 0;
+        p.errors = Number(msg.errors) || 0;
+        p.winner = msg.winner || null;
+
+        if (group && !group.results.some(r => r.gameId === gameId)) {
+          group.results.push({
+            gameId,
+            roomCode: room.roomId,
+            playerName: p.name,
+            datetime: new Date().toISOString(),
+            caseVal: String(msg.caseVal || '—'),
+            deal: String(msg.deal || 'No Deal'),
+            final: String(msg.final || '—'),
+            pts: String(msg.pts || '—'),
+            ptsNum: Number(msg.ptsNum) || 0,
+            errors: Number(msg.errors) || 0,
+            winner: String(msg.winner || '—'),
+            alerts: p.alerts || 0,
+          });
+          p.gamesDone = (p.gamesDone || 0) + 1;
+          saveDb();
+          console.log(`[DB] result saved: ${p.name} — ${msg.pts} (${group.name})`);
+        }
+        pushInfo(room);
+        break;
+      }
+
+      // ── Teacher sends a command ────────────────────────────────────────
       case 'host_broadcast': {
         const room = rooms.get(boundRoomId);
         if (!room || !isHost) return;
+        const payload = msg.payload || {};
+        const targetId = msg.targetId ? String(msg.targetId) : null;
 
-        // If a target group name is given, send only to that group
-        const target = msg.target ? String(msg.target) : null;
-        let sent = 0;
-        for (const g of room.groups.values()) {
-          if (target && g.name !== target) continue;
-          sendTo(g.ws, { type: 'host_message', payload: msg.payload });
-          sent++;
+        if (!targetId && payload.cmd === 'start_game') {
+          room.started = true;
+          room.startPayload = payload;
         }
-        console.log(`[ROOM] "${boundRoomId}" host broadcast -> ${target || 'all'} (${sent}):`, msg.payload && msg.payload.cmd);
+
+        let sent = 0;
+        for (const p of Array.from(room.players.values())) {
+          if (targetId && p.id !== targetId) continue;
+          sendTo(p.ws, { type: 'host_message', payload });
+          sent++;
+          if (payload.cmd === 'kick') {
+            room.kicked.add(p.key);
+            room.players.delete(p.id);
+            const sock = p.ws;
+            setTimeout(() => { try { sock && sock.close(); } catch (e) {} }, 400);
+          }
+        }
+        console.log(`[ROOM] "${boundRoomId}" host → ${targetId || 'all'} (${sent}):`, payload.cmd);
+        pushInfo(room);
         break;
       }
 
-      // ── A group reports it lost focus / left the tab ───────────────────
-      case 'group_alert': {
+      // ── Student left the tab ───────────────────────────────────────────
+      case 'player_alert': {
         const room = rooms.get(boundRoomId);
         if (!room) return;
-        const g = room.groups.get(boundGroupId || msg.groupId);
-        if (!g) return;
+        const p = room.players.get(boundPlayerId);
+        if (!p) return;
+        p.alerts = (p.alerts || 0) + 1;
+        console.log(`[ALERT] "${p.name}" left the tab (${p.alerts}x) in "${boundRoomId}"`);
+        notifyHost(room, { type: 'player_alert', playerId: p.id, playerName: p.name, alertType: msg.alertType || 'tab_leave', count: p.alerts, at: msg.at || '' });
+        pushInfo(room);
+        break;
+      }
 
-        g.alerts = (g.alerts || 0) + 1;
-
-        console.log(`[ALERT] "${g.name}" left the tab (${g.alerts}x) in room "${boundRoomId}"`);
-
-        // Tell the teacher right away
-        notifyHost(room, {
-          type: 'group_alert',
-          groupName: g.name,
-          alertType: msg.alertType || 'tab_leave',
-          count: g.alerts,
-          at: msg.at || '',
-        });
-        // Refresh the dashboard counters too
-        notifyHost(room, { type: 'group_update', info: roomInfo(room) });
+      // ── Teacher ends the room on purpose ───────────────────────────────
+      case 'host_end': {
+        const room = rooms.get(boundRoomId);
+        if (!room || !isHost || room.hostWs !== ws) return;
+        room.hostWs = null;                       // don't send the teacher their own "closed" error
+        closeRoom(boundRoomId, 'The teacher ended the session.');
+        boundRoomId = null; isHost = false;
         break;
       }
 
@@ -362,33 +534,33 @@ wss.on('connection', (ws, req) => {
     if (!room) return;
 
     if (isHost && room.hostWs === ws) {
-      // Host closed → tell every connected group the session ended, then
-      // remove the room entirely. This is what makes the room/link "die"
-      // immediately when the teacher stops the server or leaves the page.
-      console.log(`[ROOM] "${boundRoomId}" host disconnected — closing room`);
-      for (const g of room.groups.values()) {
-        sendTo(g.ws, { type: 'error', msg: 'The host ended the session.' });
-      }
-      rooms.delete(boundRoomId);
+      console.log(`[ROOM] "${boundRoomId}" host disconnected — waiting ${HOST_GRACE_MS / 1000}s`);
+      const rid = boundRoomId;
+      room.hostWs = null;
+      room.hostTimer = setTimeout(() => closeRoom(rid, 'The teacher ended the session.'), HOST_GRACE_MS);
       return;
     }
 
-    if (boundGroupId && room.groups.has(boundGroupId)) {
-      room.groups.get(boundGroupId).status = 'disconnected';
-      notifyHost(room, { type: 'group_disconnected', info: roomInfo(room) });
-      room.groups.delete(boundGroupId);
-      console.log(`[ROOM] group left "${boundRoomId}"`);
+    if (boundPlayerId && room.players.has(boundPlayerId)) {
+      const p = room.players.get(boundPlayerId);
+      if (p.ws === ws) {
+        if (p.status !== 'done') p.status = 'disconnected';
+        p.ws = null;
+        pushInfo(room);
+      }
     }
   });
 
-  ws.on('error', (err) => console.error('[WS] error:', err.message));
+  ws.on('error', (e) => console.error('[WS] error:', e.message));
 });
 
 // ──────────────────────────────────────────────────────────────────────────
 // STARTUP
 // ──────────────────────────────────────────────────────────────────────────
+loadDb();
+
 server.listen(PORT, HOST, () => {
-  const isCloud = !!process.env.PORT; // Render/Glitch/Railway inject PORT
+  const isCloud = !!process.env.PORT;
   console.log('\n╔════════════════════════════════════════════════════════════╗');
   console.log('║   DEAL OR NO DEAL – SERVER RUNNING                        ║');
   console.log('║                 © 2026 JODEL                               ║');
@@ -401,18 +573,15 @@ server.listen(PORT, HOST, () => {
     console.log(`   Teacher (this computer): http://localhost:${PORT}`);
     console.log(`   Students (same WiFi):    http://${localIP}:${PORT}`);
   }
-  console.log('\nBoth modes use the exact same game file and the exact same');
-  console.log('multiplayer protocol — nothing else to configure.\n');
+  console.log(`\n🗂  Database: ${DB_FILE}  (${Object.keys(db.groups).length} group(s))\n`);
 });
 
-process.on('SIGINT', () => {
-  console.log('\n✓ Shutting down — all rooms closed.');
-  for (const [roomId, room] of rooms) {
-    for (const g of room.groups.values()) sendTo(g.ws, { type: 'error', msg: 'The host ended the session.' });
-    notifyHost(room, { type: 'error', msg: 'Server stopped.' });
-  }
+function shutdown() {
+  console.log('\n✓ Shutting down — saving database, closing rooms.');
+  saveDbNow();
+  for (const rid of Array.from(rooms.keys())) closeRoom(rid, 'The server was stopped.');
   server.close(() => process.exit(0));
-});
-process.on('SIGTERM', () => {
-  server.close(() => process.exit(0));
-});
+  setTimeout(() => process.exit(0), 1500);
+}
+process.on('SIGINT', shutdown);
+process.on('SIGTERM', shutdown);
