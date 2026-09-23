@@ -1067,7 +1067,7 @@ html,body{width:100%;min-height:100%;background:var(--bg);color:var(--text);font
 
 <!-- ============ GROUP FILE MODAL (multiplayer history) ============ -->
 <div class="modal-ov" id="groupFileModal" style="z-index:2200;">
-  <div class="q-modal" style="max-width:620px;border-color:var(--gold);">
+  <div class="q-modal" style="max-width:820px;border-color:var(--gold);">
     <div style="text-align:center;margin-bottom:14px;">
       <div style="font-size:2.2rem">🗂</div>
       <div id="gfTitle" style="font-family:var(--font-head);color:var(--gold);font-size:1.05rem;letter-spacing:2px;margin-top:6px;">GROUP</div>
@@ -2518,7 +2518,7 @@ function showResult(caseVal){
   // Save history (include points score)
   const finalPts=calculateOfferPoints(finalVal);
   const _now=new Date();
-  const _isMp = (typeof MP!=='undefined' && MP.role==='group');
+  const _isMp = (typeof MP!=='undefined' && MP.role==='player' && MP.joined);
   const rec={
     name:GS.playerName,
     date:_now.toLocaleDateString(),
@@ -2533,20 +2533,16 @@ function showResult(caseVal){
     winner:studentWins?'Student':'Banker',
     mode:_isMp?'multiplayer':'solo',
     groupName:_isMp?(MP.groupName||''):'',
-    roomId:_isMp?(MP.roomId||''):'',
-    members:_isMp?(MP.members||[]):[]
+    roomId:_isMp?(MP.roomId||''):''
   };
   GS.history.unshift(rec);
   GS.history=GS.history.slice(0,100);
   localStorage.setItem('dond_hist',JSON.stringify(GS.history));
 
-  // Multiplayer: also file this group's result as its own "group file"
-  if(_isMp){
-    try{ mpSaveGroupFile(rec); }catch(e){ console.warn('group file save failed', e); }
+  // Multiplayer: send THIS student's own score to the teacher + group database
+  if(_isMp && typeof mpReportResult==='function'){
+    try{ mpReportResult(rec); }catch(e){ console.warn('result report failed', e); }
   }
-
-  // Report final progress to the teacher dashboard
-  if(typeof mpReportProgress==='function'){ try{ mpReportProgress('done'); }catch(e){} }
 
   // (DEAL music already started in openPlayerCase)
 
@@ -2632,36 +2628,70 @@ function esc(s){
   return String(s==null?'':s).replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
-/* ---- Group files (multiplayer) storage ---- */
+/* ---- Multiplayer GROUP DATABASE (lives on the server, cached on this device) ----
+   A "group" works like a class: it keeps its students and every game each
+   student finished. The server writes it to dond-database.json; this device
+   keeps a copy so HISTORY / LEADERBOARD still open without the server. */
+const MPDB_CACHE_KEY='dond_db_cache';
+
+function mpDbCache(){
+  try{
+    const d=JSON.parse(localStorage.getItem(MPDB_CACHE_KEY)||'null');
+    return (d&&d.groups)?d:{version:3,groups:{}};
+  }catch(e){ return {version:3,groups:{}}; }
+}
+function mpHasServer(){ return location.protocol==='http:'||location.protocol==='https:'; }
+
+/* Get the latest database. cb(db, fromServer) */
+function mpDbFetch(cb){
+  if(!mpHasServer()){ cb(mpDbCache(), false); return; }
+  fetch('/api/db',{cache:'no-store'})
+    .then(r=>{ if(!r.ok) throw new Error('HTTP '+r.status); return r.json(); })
+    .then(d=>{
+      if(!d||!d.groups) throw new Error('bad db');
+      try{ localStorage.setItem(MPDB_CACHE_KEY, JSON.stringify(d)); }catch(e){}
+      cb(d, true);
+    })
+    .catch(()=>cb(mpDbCache(), false));
+}
+
+function mpFmtDT(iso){
+  if(!iso) return {date:'—',time:''};
+  const d=new Date(iso);
+  if(isNaN(d)) return {date:String(iso),time:''};
+  return {date:d.toLocaleDateString(), time:d.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})};
+}
+
+/* Per-student summary for one group, ranked by best score */
+function mpGroupStats(g){
+  const results=(g.results||[]);
+  const byKey={};
+  Object.keys(g.players||{}).forEach(k=>{
+    byKey[k]={name:g.players[k].name, games:0, best:null, latest:null, totalPts:0, alerts:0};
+  });
+  results.forEach(r=>{
+    const k=String(r.playerName||'').trim().replace(/\s+/g,' ').toLowerCase();
+    if(!byKey[k]) byKey[k]={name:r.playerName, games:0, best:null, latest:null, totalPts:0, alerts:0};
+    const s=byKey[k];
+    s.games++;
+    s.totalPts+=(Number(r.ptsNum)||0);
+    s.alerts=Math.max(s.alerts, Number(r.alerts)||0);
+    if(!s.best||(Number(r.ptsNum)||0)>(Number(s.best.ptsNum)||0)) s.best=r;
+    if(!s.latest||String(r.datetime)>String(s.latest.datetime)) s.latest=r;
+  });
+  const students=Object.values(byKey).sort((a,b)=>{
+    const av=a.best?Number(a.best.ptsNum)||0:-1, bv=b.best?Number(b.best.ptsNum)||0:-1;
+    return bv-av || String(a.name).localeCompare(String(b.name));
+  });
+  const played=students.filter(s=>s.best);
+  const avg=played.length? played.reduce((t,s)=>t+(Number(s.best.ptsNum)||0),0)/played.length : 0;
+  return {students, played, avg, games:results.length};
+}
+function mpFmtNum(n){ n=Number(n)||0; return (n%1===0?n:n.toFixed(2))+' pts'; }
+
+/* ---- Older (v2) group files — shown read-only so nothing is lost ---- */
 function mpLoadGroupFiles(){
   try{ return JSON.parse(localStorage.getItem('dond_mp_files')||'[]'); }catch(e){ return []; }
-}
-function mpSaveGroupFileRecord(list){
-  localStorage.setItem('dond_mp_files', JSON.stringify(list.slice(0,200)));
-}
-/* Called by a GROUP device when it finishes, and by the HOST for every group it sees finish. */
-function mpSaveGroupFile(rec){
-  const list=mpLoadGroupFiles();
-  const key=(rec.roomId||'')+'|'+(rec.groupName||'')+'|'+(rec.date||'');
-  const existingIdx=list.findIndex(g=>g.key===key);
-  const entry={
-    key,
-    roomId:rec.roomId||'',
-    groupName:rec.groupName||rec.name||'Group',
-    members:(rec.members&&rec.members.length)?rec.members:[rec.name||'—'],
-    date:rec.date||'',
-    time:rec.time||'',
-    datetime:rec.datetime||new Date().toISOString(),
-    caseVal:rec.caseVal||'—',
-    deal:rec.deal||'—',
-    final:rec.final||'—',
-    pts:rec.pts||'—',
-    ptsNum:(typeof rec.ptsNum==='number')?rec.ptsNum:0,
-    errors:rec.errors||0,
-    winner:rec.winner||'—'
-  };
-  if(existingIdx>=0) list[existingIdx]=entry; else list.unshift(entry);
-  mpSaveGroupFileRecord(list);
 }
 
 function histSwitchTab(tab){
@@ -2676,13 +2706,22 @@ function histClearCurrent(){
     if(!confirm('Clear all SOLO game history? This cannot be undone.')) return;
     GS.history=GS.history.filter(r=>r.mode==='multiplayer');
     localStorage.setItem('dond_hist',JSON.stringify(GS.history));
-  }else{
-    if(!confirm('Clear all MULTIPLAYER group files? This cannot be undone.')) return;
-    localStorage.setItem('dond_mp_files','[]');
-    GS.history=GS.history.filter(r=>r.mode!=='multiplayer');
-    localStorage.setItem('dond_hist',JSON.stringify(GS.history));
+    renderHistory();
+    return;
   }
-  renderHistory();
+  if(!confirm('Delete EVERY group, with all its students and scores?\n\nThis clears the group database on the server and cannot be undone.')) return;
+  localStorage.setItem(MPDB_CACHE_KEY, JSON.stringify({version:3,groups:{}}));
+  localStorage.setItem('dond_mp_files','[]');
+  GS.history=GS.history.filter(r=>r.mode!=='multiplayer');
+  localStorage.setItem('dond_hist',JSON.stringify(GS.history));
+  if(mpHasServer()){
+    fetch('/api/db/clear',{method:'POST'}).then(()=>renderHistory()).catch(()=>{
+      alert('Cleared on this device, but the server could not be reached — the server copy was not cleared.');
+      renderHistory();
+    });
+  } else {
+    renderHistory();
+  }
 }
 
 function renderHistory(){
@@ -2720,62 +2759,144 @@ function renderSoloHistory(el){
 }
 
 function renderMpHistory(el){
-  const files=mpLoadGroupFiles();
-  if(files.length===0){
-    el.innerHTML='<p style="color:var(--dim);text-align:center;font-size:1rem;padding:30px 0;">No multiplayer sessions recorded yet.<br><span style="font-size:0.82rem">Each group that finishes gets its own file here.</span></p>';
-    return;
-  }
-  el.innerHTML=`
-    <div style="font-size:0.8rem;color:var(--dim);text-align:center;margin-bottom:14px;">
-      📂 ${files.length} group file${files.length===1?'':'s'} — click a folder to open it
-    </div>
-    <div class="gf-grid">
-      ${files.map((g,i)=>`
-        <div class="gf-item" onclick="openGroupFile(${i})" title="${esc(g.groupName)}">
-          <div class="gf-icon">🗂</div>
-          <div class="gf-name">${esc(g.groupName)}</div>
-          <div class="gf-meta">${esc(g.date)}</div>
-          <div class="gf-meta" style="color:var(--green)">${esc(g.pts)}</div>
-          <div class="gf-meta" style="opacity:0.65">${g.members.length} member${g.members.length===1?'':'s'}</div>
+  el.innerHTML='<p style="color:var(--dim);text-align:center;padding:30px 0;">Loading groups…</p>';
+  mpDbFetch((dbData, fromServer)=>{
+    if(HIST_TAB!=='mp') return;
+    const groups=Object.values(dbData.groups||{}).sort((a,b)=>String(b.createdAt).localeCompare(String(a.createdAt)));
+    const legacy=mpLoadGroupFiles();
+    const srcNote = fromServer
+      ? '🟢 Live from the server database'
+      : (mpHasServer() ? '🟠 Server not reachable — showing the copy saved on this device' : '📁 Opened as a file — showing the copy saved on this device');
+
+    let html=`<div style="font-size:0.72rem;color:var(--dim);text-align:center;margin-bottom:6px;">${srcNote}</div>`;
+    if(groups.length===0){
+      html+='<p style="color:var(--dim);text-align:center;font-size:1rem;padding:24px 0;">No groups yet.<br><span style="font-size:0.82rem">Create a group from MULTIPLAYER → I AM THE HOST. Every student who joins is added to it.</span></p>';
+    } else {
+      html+=`
+        <div style="font-size:0.8rem;color:var(--dim);text-align:center;margin-bottom:14px;">
+          📂 ${groups.length} group${groups.length===1?'':'s'} — click a folder to see its students and scores
         </div>
-      `).join('')}
-    </div>
-  `;
+        <div class="gf-grid">
+          ${groups.map(g=>{
+            const st=mpGroupStats(g);
+            return `<div class="gf-item" onclick="openGroupFile('${esc(g.id)}')" title="${esc(g.name)}">
+              <div class="gf-icon">🗂</div>
+              <div class="gf-name">${esc(g.name)}</div>
+              <div class="gf-meta">${st.students.length} student${st.students.length===1?'':'s'}</div>
+              <div class="gf-meta">${st.games} game${st.games===1?'':'s'}</div>
+              <div class="gf-meta" style="color:var(--green)">avg ${st.played.length?mpFmtNum(st.avg):'—'}</div>
+            </div>`;
+          }).join('')}
+        </div>`;
+    }
+    if(legacy.length){
+      html+=`
+        <div style="font-family:var(--font-head);color:var(--dim);font-size:0.7rem;letter-spacing:2px;margin:24px 0 10px;text-align:center;">OLDER GROUP FILES (before per-student scoring)</div>
+        <div class="gf-grid">
+          ${legacy.map((g,i)=>`
+            <div class="gf-item" style="opacity:0.7" onclick="openLegacyGroupFile(${i})" title="${esc(g.groupName)}">
+              <div class="gf-icon">📁</div>
+              <div class="gf-name">${esc(g.groupName)}</div>
+              <div class="gf-meta">${esc(g.date)}</div>
+              <div class="gf-meta" style="color:var(--green)">${esc(g.pts)}</div>
+            </div>`).join('')}
+        </div>`;
+    }
+    el.innerHTML=html;
+  });
 }
 
-function openGroupFile(idx){
-  const files=mpLoadGroupFiles();
-  const g=files[idx];
-  if(!g) return;
-  document.getElementById('gfTitle').textContent='🗂 '+g.groupName;
-  document.getElementById('gfSub').textContent=
-    (g.roomId?('Room '+g.roomId+' · '):'')+g.date+(g.time?(' at '+g.time):'');
+function openGroupFile(groupId){
+  mpDbFetch((dbData)=>{
+    const g=(dbData.groups||{})[groupId];
+    if(!g){ alert('That group was not found (it may have been deleted).'); renderHistory(); return; }
+    const st=mpGroupStats(g);
+    const created=mpFmtDT(g.createdAt);
+    const codes=(g.codes||[]).map(c=>c.code);
+    document.getElementById('gfTitle').textContent='🗂 '+g.name;
+    document.getElementById('gfSub').textContent='Created '+created.date+(created.time?(' at '+created.time):'')+(codes.length?(' · Codes used: '+codes.join(', ')):'');
 
+    const top=st.played[0];
+    const games=[...(g.results||[])].sort((a,b)=>String(b.datetime).localeCompare(String(a.datetime)));
+
+    document.getElementById('gfBody').innerHTML=`
+      <div class="gf-summary">
+        <div class="gf-sum-item"><span>STUDENTS</span><strong style="color:var(--blue)">${st.students.length}</strong></div>
+        <div class="gf-sum-item"><span>GAMES PLAYED</span><strong style="color:var(--gold)">${st.games}</strong></div>
+        <div class="gf-sum-item"><span>CLASS AVERAGE</span><strong style="color:var(--green)">${st.played.length?mpFmtNum(st.avg):'—'}</strong></div>
+        <div class="gf-sum-item"><span>TOP STUDENT</span><strong style="color:var(--gold)">${top?esc(top.name):'—'}</strong></div>
+      </div>
+
+      <div style="font-family:var(--font-head);color:var(--gold);font-size:0.72rem;letter-spacing:2px;margin:16px 0 8px;">👤 STUDENTS &amp; SCORES</div>
+      <div style="overflow-x:auto;">
+      <table class="hist-table">
+        <thead><tr><th>Rank</th><th>Student</th><th>Games</th><th>Best Score</th><th>Latest Score</th><th>Errors (best)</th></tr></thead>
+        <tbody>
+          ${st.students.length?st.students.map((s,i)=>`<tr class="${i===0&&s.best?'lb-top':''}">
+            <td style="font-family:var(--font-head);color:var(--gold)">${s.best?medal(i):'—'}</td>
+            <td><strong>${esc(s.name)}</strong></td>
+            <td>${s.games}</td>
+            <td style="color:var(--green);font-family:var(--font-head);font-size:0.78rem">${s.best?esc(s.best.pts):'<span style="color:var(--dim)">not finished</span>'}</td>
+            <td style="color:var(--blue);font-family:var(--font-head);font-size:0.78rem">${s.latest?esc(s.latest.pts):'—'}</td>
+            <td style="color:var(--red)">${s.best?esc(s.best.errors):'—'}</td>
+          </tr>`).join(''):'<tr><td colspan="6" style="color:var(--dim);text-align:center;">No students have joined yet.</td></tr>'}
+        </tbody>
+      </table>
+      </div>
+
+      <div style="font-family:var(--font-head);color:var(--blue);font-size:0.72rem;letter-spacing:2px;margin:18px 0 8px;">🎮 EVERY GAME</div>
+      <div style="overflow-x:auto;">
+      <table class="hist-table">
+        <thead><tr><th>Date &amp; Time</th><th>Code</th><th>Student</th><th>Case</th><th>Deal</th><th>Points</th><th>Errors</th><th>Result</th></tr></thead>
+        <tbody>
+          ${games.length?games.map(r=>{ const dt=mpFmtDT(r.datetime); return `<tr>
+            <td style="color:var(--dim);font-size:0.72rem">${esc(dt.date)}<br><span style="opacity:0.7">${esc(dt.time)}</span></td>
+            <td style="font-family:var(--font-head);font-size:0.68rem;color:var(--dim)">${esc(r.roomCode)}</td>
+            <td><strong>${esc(r.playerName)}</strong></td>
+            <td style="color:var(--gold);font-family:var(--font-head);font-size:0.72rem">${esc(r.caseVal)}</td>
+            <td style="color:var(--blue);font-family:var(--font-head);font-size:0.72rem">${esc(r.deal)}</td>
+            <td style="color:var(--green);font-family:var(--font-head);font-size:0.74rem">${esc(r.pts)}</td>
+            <td style="color:var(--red)">${esc(r.errors)}</td>
+            <td><span class="badge ${r.winner==='Student'?'badge-s':'badge-b'}">${esc(r.winner)}</span></td>
+          </tr>`;}).join(''):'<tr><td colspan="8" style="color:var(--dim);text-align:center;">No finished games yet.</td></tr>'}
+        </tbody>
+      </table>
+      </div>
+      ${mpHasServer()?`<button class="btn btn-blue" style="width:100%;margin-top:14px;opacity:0.8;font-size:0.75rem;padding:9px;" onclick="deleteGroupFile('${esc(g.id)}')">🗑 DELETE THIS GROUP</button>`:''}
+    `;
+    document.getElementById('groupFileModal').classList.add('show');
+  });
+}
+
+function deleteGroupFile(groupId){
+  const cache=mpDbCache();
+  const name=(cache.groups[groupId]&&cache.groups[groupId].name)||'this group';
+  if(!confirm('Delete "'+name+'" with all its students and scores?\n\nThis cannot be undone.')) return;
+  fetch('/api/groups/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:groupId})})
+    .then(r=>r.json())
+    .then(res=>{
+      if(!res.ok) alert(res.msg||'Could not delete the group.');
+      document.getElementById('groupFileModal').classList.remove('show');
+      renderHistory();
+    })
+    .catch(()=>alert('The server could not be reached. Nothing was deleted.'));
+}
+
+function openLegacyGroupFile(idx){
+  const g=mpLoadGroupFiles()[idx];
+  if(!g) return;
+  document.getElementById('gfTitle').textContent='📁 '+g.groupName;
+  document.getElementById('gfSub').textContent=(g.roomId?('Room '+g.roomId+' · '):'')+g.date+(g.time?(' at '+g.time):'')+' · older record';
   document.getElementById('gfBody').innerHTML=`
     <div class="gf-summary">
       <div class="gf-sum-item"><span>CASE VALUE</span><strong style="color:var(--gold)">${esc(g.caseVal)}</strong></div>
       <div class="gf-sum-item"><span>DEAL</span><strong style="color:var(--blue)">${esc(g.deal)}</strong></div>
       <div class="gf-sum-item"><span>FINAL VALUE</span><strong style="color:var(--gold)">${esc(g.final)}</strong></div>
-      <div class="gf-sum-item"><span>GROUP SCORE</span><strong style="color:var(--green)">${esc(g.pts)}</strong></div>
+      <div class="gf-sum-item"><span>SCORE</span><strong style="color:var(--green)">${esc(g.pts)}</strong></div>
       <div class="gf-sum-item"><span>ERRORS</span><strong style="color:var(--red)">${esc(g.errors)}</strong></div>
-      <div class="gf-sum-item"><span>RESULT</span><strong>${esc(g.winner)}</strong></div>
     </div>
-
-    <div style="font-family:var(--font-head);color:var(--gold);font-size:0.72rem;letter-spacing:2px;margin:16px 0 8px;">👥 MEMBERS &amp; SCORES</div>
-    <table class="hist-table">
-      <thead><tr><th>#</th><th>Member Name</th><th>Score Earned</th><th>Errors</th></tr></thead>
-      <tbody>
-        ${g.members.map((m,i)=>`<tr>
-          <td>${i+1}</td>
-          <td><strong>${esc(m)}</strong></td>
-          <td style="color:var(--green);font-family:var(--font-head);font-size:0.78rem">${esc(g.pts)}</td>
-          <td style="color:var(--red)">${esc(g.errors)}</td>
-        </tr>`).join('')}
-      </tbody>
-    </table>
-    <div style="font-size:0.7rem;color:var(--dim);margin-top:8px;line-height:1.5;">
-      Every member of a group shares the group's score, since the group plays one game together.
-    </div>
+    <div style="font-size:0.75rem;color:var(--dim);margin-top:12px;">Members: ${esc((g.members||[]).join(', ')||'—')}</div>
+    <div style="font-size:0.7rem;color:var(--dim);margin-top:8px;">This record was saved before each student had their own score.</div>
   `;
   document.getElementById('groupFileModal').classList.add('show');
 }
@@ -2783,6 +2904,7 @@ function openGroupFile(idx){
 /* =============================================
    LEADERBOARD
 ============================================= */
+let LB_GROUP='all';
 function showLeaderboard(){ renderLeaderboard(); showScreen('leaderboardScreen'); }
 
 function lbSwitchTab(tab){
@@ -2805,7 +2927,6 @@ function renderSoloLeaderboard(el){
   if(rows.length===0){
     el.innerHTML='<p style="color:var(--dim);text-align:center;padding:30px 0;">No solo scores yet.</p>';return;
   }
-  // Best score per player name
   const best={};
   rows.forEach(r=>{
     const k=(r.name||'—').trim().toLowerCase();
@@ -2833,53 +2954,73 @@ function renderSoloLeaderboard(el){
   `;
 }
 
+function lbSetGroup(v){ LB_GROUP=v; renderLeaderboard(); }
+
 function renderMpLeaderboard(el){
-  const files=mpLoadGroupFiles();
-  if(files.length===0){
-    el.innerHTML='<p style="color:var(--dim);text-align:center;padding:30px 0;">No multiplayer scores yet.</p>';return;
-  }
-  // Group ranking
-  const groups=[...files].sort((a,b)=>b.ptsNum-a.ptsNum);
+  el.innerHTML='<p style="color:var(--dim);text-align:center;padding:30px 0;">Loading scores…</p>';
+  mpDbFetch((dbData)=>{
+    if(LB_TAB!=='mp') return;
+    const groups=Object.values(dbData.groups||{});
+    const withGames=groups.filter(g=>(g.results||[]).length);
+    if(withGames.length===0){
+      el.innerHTML='<p style="color:var(--dim);text-align:center;padding:30px 0;">No multiplayer scores yet.</p>';return;
+    }
+    if(LB_GROUP!=='all' && !groups.some(g=>g.id===LB_GROUP)) LB_GROUP='all';
 
-  // Member ranking (each member carries their group's score)
-  const members=[];
-  files.forEach(g=>{
-    g.members.forEach(m=>{
-      members.push({member:m, groupName:g.groupName, ptsNum:g.ptsNum, pts:g.pts, errors:g.errors, date:g.date});
+    const picker=`
+      <div style="display:flex;justify-content:center;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap;">
+        <span style="font-size:0.75rem;color:var(--dim);">SHOW:</span>
+        <select class="mp-select" onchange="lbSetGroup(this.value)">
+          <option value="all"${LB_GROUP==='all'?' selected':''}>All groups</option>
+          ${groups.map(g=>`<option value="${esc(g.id)}"${LB_GROUP===g.id?' selected':''}>${esc(g.name)}</option>`).join('')}
+        </select>
+      </div>`;
+
+    // Student ranking — best score per student, per group
+    const students=[];
+    groups.forEach(g=>{
+      if(LB_GROUP!=='all' && g.id!==LB_GROUP) return;
+      mpGroupStats(g).played.forEach(s=>students.push({name:s.name, groupName:g.name, best:s.best, games:s.games}));
     });
+    students.sort((a,b)=>(Number(b.best.ptsNum)||0)-(Number(a.best.ptsNum)||0));
+
+    // Group ranking — class average of each student's best score
+    const groupRows=withGames.map(g=>{ const st=mpGroupStats(g); return {g, st}; })
+      .sort((a,b)=>b.st.avg-a.st.avg);
+
+    el.innerHTML=picker+`
+      ${LB_GROUP==='all'?`
+      <div style="font-family:var(--font-head);color:var(--gold);font-size:0.75rem;letter-spacing:2px;margin:4px 0 10px;">🏅 TOP GROUPS <span style="color:var(--dim);font-size:0.62rem;letter-spacing:1px;">(average of each student's best score)</span></div>
+      <table class="hist-table">
+        <thead><tr><th>Rank</th><th>Group</th><th>Class Average</th><th>Students</th><th>Top Student</th></tr></thead>
+        <tbody>
+          ${groupRows.map((x,i)=>`<tr class="${i===0?'lb-top':''}">
+            <td style="font-family:var(--font-head);color:var(--gold)">${medal(i)}</td>
+            <td><strong>${esc(x.g.name)}</strong></td>
+            <td style="color:var(--green);font-family:var(--font-head);font-size:0.82rem;text-shadow:0 0 8px var(--green2)">${mpFmtNum(x.st.avg)}</td>
+            <td>${x.st.played.length}</td>
+            <td style="color:var(--gold)">${x.st.played[0]?esc(x.st.played[0].name):'—'}</td>
+          </tr>`).join('')}
+        </tbody>
+      </table>`:''}
+
+      <div style="font-family:var(--font-head);color:var(--blue);font-size:0.75rem;letter-spacing:2px;margin:22px 0 10px;">👤 TOP STUDENTS</div>
+      <table class="hist-table">
+        <thead><tr><th>Rank</th><th>Student</th>${LB_GROUP==='all'?'<th>Group</th>':''}<th>Best Score</th><th>Final Value</th><th>Errors</th><th>Games</th></tr></thead>
+        <tbody>
+          ${students.length?students.map((r,i)=>`<tr class="${i===0?'lb-top':''}">
+            <td style="font-family:var(--font-head);color:var(--gold)">${medal(i)}</td>
+            <td><strong>${esc(r.name)}</strong></td>
+            ${LB_GROUP==='all'?`<td style="color:var(--blue)">${esc(r.groupName)}</td>`:''}
+            <td style="color:var(--green);font-family:var(--font-head);font-size:0.82rem">${esc(r.best.pts)}</td>
+            <td style="color:var(--gold);font-family:var(--font-head);font-size:0.76rem">${esc(r.best.final)}</td>
+            <td style="color:var(--red)">${esc(r.best.errors)}</td>
+            <td>${r.games}</td>
+          </tr>`).join(''):'<tr><td colspan="7" style="color:var(--dim);text-align:center;">No finished games in this group yet.</td></tr>'}
+        </tbody>
+      </table>
+    `;
   });
-  members.sort((a,b)=>b.ptsNum-a.ptsNum);
-
-  el.innerHTML=`
-    <div style="font-family:var(--font-head);color:var(--gold);font-size:0.75rem;letter-spacing:2px;margin:4px 0 10px;">🏅 TOP GROUPS</div>
-    <table class="hist-table">
-      <thead><tr><th>Rank</th><th>Group</th><th>Score</th><th>Final Value</th><th>Errors</th><th>Date</th></tr></thead>
-      <tbody>
-        ${groups.map((g,i)=>`<tr class="${i===0?'lb-top':''}">
-          <td style="font-family:var(--font-head);color:var(--gold)">${medal(i)}</td>
-          <td><strong>${esc(g.groupName)}</strong></td>
-          <td style="color:var(--green);font-family:var(--font-head);font-size:0.82rem;text-shadow:0 0 8px var(--green2)">${esc(g.pts)}</td>
-          <td style="color:var(--gold);font-family:var(--font-head);font-size:0.78rem">${esc(g.final)}</td>
-          <td style="color:var(--red)">${esc(g.errors)}</td>
-          <td style="color:var(--dim);font-size:0.75rem">${esc(g.date)}</td>
-        </tr>`).join('')}
-      </tbody>
-    </table>
-
-    <div style="font-family:var(--font-head);color:var(--blue);font-size:0.75rem;letter-spacing:2px;margin:22px 0 10px;">👤 TOP MEMBERS (across all groups)</div>
-    <table class="hist-table">
-      <thead><tr><th>Rank</th><th>Member</th><th>Group</th><th>Score</th><th>Errors</th></tr></thead>
-      <tbody>
-        ${members.map((r,i)=>`<tr class="${i===0?'lb-top':''}">
-          <td style="font-family:var(--font-head);color:var(--gold)">${medal(i)}</td>
-          <td><strong>${esc(r.member)}</strong></td>
-          <td style="color:var(--blue)">${esc(r.groupName)}</td>
-          <td style="color:var(--green);font-family:var(--font-head);font-size:0.82rem">${esc(r.pts)}</td>
-          <td style="color:var(--red)">${esc(r.errors)}</td>
-        </tr>`).join('')}
-      </tbody>
-    </table>
-  `;
 }
 
 /* =============================================
@@ -2916,6 +3057,7 @@ function showQModal(){
 }
 function closeQModal(){
   document.getElementById('qSetupModal').classList.remove('show');
+  if(typeof mpRefreshConfigSummary==='function') mpRefreshConfigSummary();
 }
 function switchQTab(tab){
   ['paste','manual','default'].forEach(t=>{
@@ -3033,18 +3175,18 @@ window.addEventListener('load',()=>{
     <div style="text-align:center;margin-bottom:18px;">
       <div style="font-size:2.5rem">🔌</div>
       <div id="mpModalTitle" style="font-family:var(--font-head);color:var(--blue);font-size:1.15rem;letter-spacing:3px;margin-top:6px;">MULTIPLAYER</div>
-      <div id="mpModalSub" style="font-size:0.78rem;color:var(--dim);margin-top:4px;">Connect every group to the same game</div>
+      <div id="mpModalSub" style="font-size:0.78rem;color:var(--dim);margin-top:4px;">Your whole class plays at the same time — every student gets their own score</div>
     </div>
 
     <!-- Role selection -->
     <div id="mpRolePane">
       <div style="font-size:0.82rem;color:var(--dim);margin-bottom:14px;text-align:center;line-height:1.6;">
-        The <strong style="color:var(--gold)">host</strong> creates a room and monitors all groups.<br>
-        Each <strong style="color:var(--blue)">group</strong> plays independently with separate banker offers.
+        The <strong style="color:var(--gold)">teacher</strong> opens a room for a group (class) and watches every student.<br>
+        Each <strong style="color:var(--blue)">student</strong> joins on their own device, types the code, then their name.
       </div>
       <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap;">
         <button class="btn btn-gold" onclick="mpSelectRole('host')" style="min-width:160px;">🏦 I AM THE HOST</button>
-        <button class="btn btn-blue" onclick="mpSelectRole('group')" style="min-width:160px;">🎮 I AM A GROUP</button>
+        <button class="btn btn-blue" onclick="mpSelectRole('player')" style="min-width:160px;">🎮 I AM A STUDENT</button>
       </div>
       <button class="btn btn-blue" style="width:100%;margin-top:14px;" onclick="closeMpModal()">✕ CANCEL</button>
     </div>
@@ -3058,80 +3200,130 @@ window.addEventListener('load',()=>{
         <div id="mpServerInfoHint" style="font-size:0.72rem;color:var(--dim);margin-top:6px;"></div>
         <button class="btn btn-blue" style="width:100%;margin-top:10px;font-size:0.75rem;padding:8px;" onclick="mpCopyServerLink()">📋 COPY LINK FOR STUDENTS</button>
       </div>
+
       <div style="margin-bottom:12px;">
-        <label style="font-size:0.75rem;color:var(--dim);display:block;margin-bottom:5px;">ROOM CODE (share with groups)</label>
-        <input id="mpHostRoomId" type="text" value="ROOM1" maxlength="8" oninput="this.value=this.value.toUpperCase()"
-          style="width:100%;background:rgba(0,0,0,0.5);border:2px solid var(--gold);border-radius:8px;color:var(--gold);font-family:var(--font-head);font-size:1.3rem;padding:12px;text-align:center;outline:none;letter-spacing:6px;">
+        <label class="mp-label">ROOM CODE (share with your students)</label>
+        <input id="mpHostRoomId" type="text" value="ROOM1" maxlength="8" oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9]/g,'')" class="mp-code-input">
         <button class="btn btn-blue" style="width:100%;margin-top:8px;font-size:0.78rem;padding:8px;" onclick="mpGenerateCode()">🎲 GENERATE RANDOM CODE</button>
-        <div style="font-size:0.7rem;color:var(--dim);margin-top:6px;text-align:center;">This is the code both you and your students type in to enter the room.</div>
+      </div>
+
+      <!-- Which group is this code for? -->
+      <div class="mp-group-box">
+        <div style="font-family:var(--font-head);font-size:0.7rem;color:var(--blue);letter-spacing:2px;margin-bottom:10px;">👥 THIS CODE IS FOR WHICH GROUP?</div>
+        <div class="mp-seg">
+          <button type="button" id="mpGmNew" class="mp-seg-btn active" onclick="mpSetGroupMode('new')">➕ CREATE NEW GROUP</button>
+          <button type="button" id="mpGmExisting" class="mp-seg-btn" onclick="mpSetGroupMode('existing')">🗂 USE EXISTING GROUP</button>
+        </div>
+        <div id="mpGmNewPane" style="margin-top:10px;">
+          <input id="mpNewGroupName" type="text" maxlength="60" placeholder="e.g. Grade 9 – Rizal" class="mp-text-input">
+          <div class="mp-help">A new group is saved in the database. Students who join with this code are added to it.</div>
+        </div>
+        <div id="mpGmExistingPane" style="display:none;margin-top:10px;">
+          <select id="mpExistingGroup" class="mp-select" style="width:100%;"></select>
+          <div id="mpExistingHint" class="mp-help">Students who join are added to this group's list. Their new scores are saved with its earlier games.</div>
+        </div>
       </div>
 
       <div style="background:rgba(255,215,0,0.06);border:1px solid rgba(255,215,0,0.3);border-radius:10px;padding:12px;margin-bottom:14px;">
-        <div style="font-family:var(--font-head);font-size:0.7rem;color:var(--gold);letter-spacing:2px;margin-bottom:8px;">⚙ GAME SETUP FOR ALL GROUPS</div>
+        <div style="font-family:var(--font-head);font-size:0.7rem;color:var(--gold);letter-spacing:2px;margin-bottom:8px;">⚙ GAME SETUP FOR EVERY STUDENT</div>
         <div id="mpConfigSummary" style="font-size:0.75rem;color:var(--dim);margin-bottom:8px;">Using default: 30 cases · built-in questions</div>
         <button class="btn btn-blue" style="width:100%;font-size:0.75rem;padding:8px;" onclick="mpOpenCaseConfig()">⚙ CUSTOMIZE CASES</button>
         <button class="btn btn-green" style="width:100%;font-size:0.75rem;padding:8px;margin-top:6px;" onclick="showQModal()">📝 CUSTOMIZE QUESTIONS</button>
-        <div style="font-size:0.7rem;color:var(--dim);margin-top:6px;">Whatever you set here is sent to every group when you press START.</div>
+        <div class="mp-help">Whatever you set here is sent to every student when you press START.</div>
       </div>
 
       <button class="btn btn-gold" style="width:100%;margin-bottom:10px;" onclick="mpHostCreate()">🏦 CREATE ROOM & MONITOR</button>
       <button class="btn btn-blue" style="width:100%;" onclick="mpBackToRole()">← BACK</button>
     </div>
 
-    <!-- Group setup -->
-    <div id="mpGroupPane" style="display:none;">
+    <!-- Student step 1: server + code -->
+    <div id="mpPlayerCodePane" style="display:none;">
+      <div class="mp-steps"><span class="on">1 · CODE</span><span>2 · YOUR NAME</span></div>
       <div style="margin-bottom:12px;" id="mpServerIpWrap">
-        <label id="mpServerIpLabel" style="font-size:0.75rem;color:var(--dim);display:block;margin-bottom:5px;">SERVER ADDRESS (from host)</label>
-        <input id="mpServerIp" type="text" placeholder="e.g. 192.168.1.100:3000"
-          style="width:100%;background:rgba(0,0,0,0.5);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:var(--font-mono);font-size:0.95rem;padding:10px;outline:none;">
-        <div id="mpServerIpHint" style="font-size:0.7rem;color:var(--dim);margin-top:5px;"></div>
-      </div>
-      <div style="margin-bottom:12px;">
-        <label style="font-size:0.75rem;color:var(--dim);display:block;margin-bottom:5px;">ROOM CODE (from host)</label>
-        <input id="mpGroupRoomId" type="text" placeholder="e.g. 7K3P9Q" value="" maxlength="8" oninput="this.value=this.value.toUpperCase()"
-          style="width:100%;background:rgba(0,0,0,0.5);border:2px solid var(--gold);border-radius:8px;color:var(--gold);font-family:var(--font-head);font-size:1.3rem;padding:12px;outline:none;text-align:center;letter-spacing:6px;">
-      </div>
-      <div style="margin-bottom:12px;">
-        <label style="font-size:0.75rem;color:var(--dim);display:block;margin-bottom:5px;">GROUP NAME</label>
-        <input id="mpGroupName" type="text" placeholder="e.g. Group Alpha"
-          style="width:100%;background:rgba(0,0,0,0.5);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:var(--font-body);font-size:1rem;padding:10px;outline:none;">
+        <label id="mpServerIpLabel" class="mp-label">SERVER ADDRESS (from teacher)</label>
+        <input id="mpServerIp" type="text" placeholder="e.g. 192.168.1.100:3000" class="mp-text-input" style="font-family:var(--font-mono);">
+        <div id="mpServerIpHint" class="mp-help"></div>
       </div>
       <div style="margin-bottom:14px;">
-        <label style="font-size:0.75rem;color:var(--dim);display:block;margin-bottom:5px;">MEMBER NAMES (separate with commas)</label>
-        <textarea id="mpGroupMembers" rows="2" placeholder="e.g. Ana Cruz, Ben Reyes, Cara Lim"
-          style="width:100%;background:rgba(0,0,0,0.5);border:1px solid var(--border);border-radius:8px;color:var(--text);font-family:var(--font-body);font-size:0.9rem;padding:10px;outline:none;resize:vertical;"></textarea>
-        <div style="font-size:0.7rem;color:var(--dim);margin-top:5px;">These names appear in your teacher's records and the leaderboard.</div>
+        <label class="mp-label">ROOM CODE (from teacher)</label>
+        <input id="mpPlayerRoomId" type="text" placeholder="e.g. 7K3P9Q" value="" maxlength="8" class="mp-code-input"
+          oninput="this.value=this.value.toUpperCase().replace(/[^A-Z0-9]/g,'')"
+          onkeydown="if(event.key==='Enter')mpPlayerCheckCode()">
       </div>
-      <button class="btn btn-blue" style="width:100%;margin-bottom:10px;" onclick="mpGroupJoin()">🔌 JOIN ROOM</button>
-      <button class="btn btn-blue" style="width:100%;" onclick="mpBackToRole()">← BACK</button>
+      <button class="btn btn-blue" style="width:100%;margin-bottom:10px;" onclick="mpPlayerCheckCode()">NEXT →</button>
+      <button class="btn btn-blue" style="width:100%;opacity:0.8;" onclick="mpBackToRole()">← BACK</button>
+    </div>
+
+    <!-- Student step 2: name -->
+    <div id="mpPlayerNamePane" style="display:none;">
+      <div class="mp-steps"><span class="done">1 · CODE ✓</span><span class="on">2 · YOUR NAME</span></div>
+      <div class="mp-joined-group">
+        <div style="font-size:0.68rem;color:var(--dim);letter-spacing:2px;">YOU ARE JOINING</div>
+        <div id="mpJoinGroupName" style="font-family:var(--font-head);color:var(--gold);font-size:1.1rem;margin-top:4px;">—</div>
+        <div id="mpJoinRoomCode" style="font-size:0.72rem;color:var(--dim);margin-top:2px;"></div>
+      </div>
+      <div style="margin-bottom:14px;">
+        <label class="mp-label">YOUR NAME</label>
+        <input id="mpPlayerName" type="text" maxlength="40" placeholder="e.g. Ana Cruz" class="mp-text-input" style="font-size:1.1rem;text-align:center;"
+          onkeydown="if(event.key==='Enter')mpPlayerJoin()">
+        <div class="mp-help">Use your real name — your teacher records your score under it.</div>
+      </div>
+      <button class="btn btn-gold" style="width:100%;margin-bottom:10px;" onclick="mpPlayerJoin()">🔌 JOIN GAME</button>
+      <button class="btn btn-blue" style="width:100%;opacity:0.8;" onclick="mpPlayerBackToCode()">← CHANGE CODE</button>
+    </div>
+
+    <!-- Student waiting room -->
+    <div id="mpWaitPane" style="display:none;text-align:center;">
+      <div style="font-size:3rem;margin-bottom:8px;">⏳</div>
+      <div style="font-family:var(--font-head);color:var(--green);font-size:1rem;letter-spacing:2px;">YOU'RE IN!</div>
+      <div id="mpWaitName" style="font-family:var(--font-head);color:var(--gold);font-size:1.3rem;margin-top:10px;">—</div>
+      <div id="mpWaitGroup" style="font-size:0.82rem;color:var(--blue);margin-top:4px;"></div>
+      <div style="font-size:0.8rem;color:var(--dim);margin-top:16px;line-height:1.6;">Waiting for your teacher to press <strong style="color:var(--green)">START</strong>…<br>Keep this tab open.</div>
+      <button class="btn btn-blue" style="width:100%;margin-top:18px;opacity:0.8;" onclick="mpLeaveRoom()">✕ LEAVE ROOM</button>
     </div>
 
     <!-- Connection status -->
     <div id="mpStatusPane" style="display:none;text-align:center;">
       <div id="mpStatusIcon" style="font-size:3rem;margin-bottom:10px;">⏳</div>
       <div id="mpStatusText" style="font-family:var(--font-head);font-size:1rem;color:var(--blue);margin-bottom:8px;">Connecting…</div>
-      <div id="mpStatusSub" style="font-size:0.8rem;color:var(--dim);"></div>
-      <button class="btn btn-blue" style="width:100%;margin-top:18px;" onclick="closeMpModal()">✕ CLOSE</button>
+      <div id="mpStatusSub" style="font-size:0.8rem;color:var(--dim);line-height:1.5;"></div>
+      <button class="btn btn-blue" id="mpStatusBack" style="width:100%;margin-top:18px;" onclick="mpStatusGoBack()">← BACK</button>
     </div>
   </div>
 </div>
 
 <!-- ============ HOST DASHBOARD SCREEN ============ -->
 <div id="hostDashScreen" class="screen" style="z-index:1;">
-  <div style="padding:20px;width:100%;max-width:900px;margin:0 auto;">
-    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:20px;flex-wrap:wrap;gap:10px;">
+  <div style="padding:20px;width:100%;max-width:980px;margin:0 auto;">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px;flex-wrap:wrap;gap:10px;">
       <div>
         <div style="font-family:var(--font-head);color:var(--gold);font-size:1.5rem;letter-spacing:3px;">🏦 HOST DASHBOARD</div>
+        <div id="hdGroupTitle" style="font-family:var(--font-head);font-size:0.95rem;color:var(--blue);margin-top:6px;">👥 —</div>
         <div style="font-family:var(--font-head);font-size:0.7rem;color:var(--dim);margin-top:4px;" id="hdRoomInfo">Room: —</div>
       </div>
-      <div style="display:flex;gap:10px;flex-wrap:wrap;">
-        <button class="btn btn-green" style="font-size:0.8rem;padding:9px 20px;" onclick="hdStartAll()">▶ START ALL GROUPS</button>
-        <button class="btn btn-gold" style="font-size:0.8rem;padding:9px 20px;" onclick="mpOpenCaseConfig()">⚙ CASES</button>
-        <button class="btn btn-blue" style="font-size:0.8rem;padding:9px 20px;" onclick="showScreen('menuScreen')">← MENU</button>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="btn btn-green" style="font-size:0.78rem;padding:9px 16px;" onclick="hdStartAll()">▶ START ALL STUDENTS</button>
+        <button class="btn btn-gold" style="font-size:0.78rem;padding:9px 16px;" onclick="mpOpenCaseConfig()">⚙ CASES</button>
+        <button class="btn btn-blue" style="font-size:0.78rem;padding:9px 16px;" onclick="showQModal()">📝 QUESTIONS</button>
+        <button class="btn btn-blue" style="font-size:0.78rem;padding:9px 16px;" onclick="showScreen('menuScreen')" title="The room stays open. Press MULTIPLAYER on the menu to come back.">← MENU</button>
+        <button class="btn btn-blue" style="font-size:0.78rem;padding:9px 16px;opacity:0.85;border-color:var(--red);color:var(--red);" onclick="hdEndRoom()">⏹ END ROOM</button>
       </div>
     </div>
 
-    <!-- Cheating / focus alerts -->
+    <div class="hd-code-banner">
+      <div>
+        <div style="font-size:0.62rem;color:var(--dim);letter-spacing:2px;">ROOM CODE</div>
+        <div id="hdBigCode" style="font-family:var(--font-head);color:var(--gold);font-size:2rem;letter-spacing:8px;">——</div>
+      </div>
+      <div class="hd-counts">
+        <div><strong id="hdCntJoined">0</strong><span>JOINED</span></div>
+        <div><strong id="hdCntPlaying" style="color:var(--blue)">0</strong><span>PLAYING</span></div>
+        <div><strong id="hdCntDone" style="color:var(--gold)">0</strong><span>FINISHED</span></div>
+        <div><strong id="hdCntRoster" style="color:var(--dim)">0</strong><span>IN GROUP</span></div>
+      </div>
+    </div>
+
+    <!-- Focus alerts -->
     <div id="hdAlertPanel" style="display:none;background:rgba(255,59,59,0.08);border:1px solid rgba(255,59,59,0.45);border-radius:12px;padding:14px;margin-bottom:18px;">
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
         <div style="font-family:var(--font-head);color:var(--red);font-size:0.78rem;letter-spacing:2px;">🚨 FOCUS ALERTS</div>
@@ -3141,11 +3333,11 @@ window.addEventListener('load',()=>{
       <div style="font-size:0.7rem;color:var(--dim);margin-top:8px;">A student left the game tab. You decide how to handle it — deduct points, warn, or remove them from the room.</div>
     </div>
 
-    <div id="hdGroupsGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px;"></div>
+    <div id="hdGroupsGrid" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:12px;"></div>
 
     <div style="margin-top:24px;background:rgba(0,0,0,0.4);border:1px solid rgba(255,215,0,0.15);border-radius:12px;padding:16px;">
-      <div style="font-family:var(--font-head);color:var(--gold);font-size:0.75rem;letter-spacing:2px;margin-bottom:12px;">📊 LIVE SCOREBOARD</div>
-      <div id="hdScoreboard" style="font-size:0.85rem;color:var(--dim);">Waiting for groups to connect…</div>
+      <div style="font-family:var(--font-head);color:var(--gold);font-size:0.75rem;letter-spacing:2px;margin-bottom:12px;">📊 LIVE SCOREBOARD — EACH STUDENT</div>
+      <div id="hdScoreboard" style="font-size:0.85rem;color:var(--dim);overflow-x:auto;">Waiting for students to join…</div>
     </div>
   </div>
 </div>
@@ -3335,14 +3527,14 @@ function ccStartGame(){
     const btn=document.getElementById('ccStartBtn');
     if(btn) btn.textContent='▶ START WITH THESE CASES';
     mpRefreshConfigSummary();
-    if(MP.roomId && MP.role==='host'){
+    if(MP.hostActive && MP.role==='host'){
       showScreen('hostDashScreen');
     }else{
-      showMpModal();
-      document.getElementById('mpRolePane').style.display='none';
-      document.getElementById('mpHostPane').style.display='block';
+      showScreen('menuScreen');
+      showMpModal(true);
+      mpShowPane('mpHostPane');
     }
-    alert('✅ Case setup saved.\n\nAll groups will use '+total+' cases when you press START ALL GROUPS.');
+    alert('✅ Case setup saved.\n\nEvery student will use '+total+' cases when you press START.');
     return;
   }
 
@@ -3525,24 +3717,43 @@ function proceedAfterCounter(){
 }
 
 /* =============================================
-   MULTIPLAYER ENGINE
+   MULTIPLAYER ENGINE  (v3 — groups work like a class)
+   ─────────────────────────────────────────────
+   • Teacher opens a room for a GROUP (new or existing).
+   • Each student joins on their own device: CODE → NAME.
+   • Every student plays their own game and has their own score.
+   • The server saves the group, its students and every result.
 ============================================= */
 const MP = {
   ws: null,
-  role: null,       // 'host' | 'group'
-  roomId: null,
-  groupId: null,
-  groupName: null,
-  members: [],
+  role: null,          // 'host' | 'player'
+  roomId: null,        // set once the room really exists / student really joined
+  pendingRoomId: null,
   serverIp: null,
   connected: false,
+  intentionalClose: false,
   reconnectTimer: null,
-  lastInfo: null,       // latest room info (host)
-  viewingGroup: null,   // group name being watched in the live view modal
-  alerts: [],           // host-side focus alerts
-  hostConfig: null,     // { values, questions, total }
-  focusLeaves: 0,       // group-side count of tab exits
-  gameActive: false,    // only alert while actually playing
+  statusBack: 'role',  // which pane the status "BACK" button returns to
+  wakeAttempts: 0,     // FIX: counts first-connect retries (Render free-tier cold start)
+
+  // host
+  hostActive: false,
+  groupMode: 'new',
+  groupId: null,
+  groupName: null,
+  groupsList: [],
+  lastInfo: null,
+  viewingId: null,
+  alerts: [],
+  hostConfig: null,    // { values, total, ... }
+
+  // student
+  joined: false,
+  playerId: null,
+  playerName: null,
+  gameId: null,
+  focusLeaves: 0,
+  gameActive: false,
 };
 
 /* Is this page being served over the internet (not a LAN/hotspot address)? */
@@ -3556,124 +3767,198 @@ function mpIsOnline(){
   return !lan;
 }
 
-// ── Detect server IP automatically ──────────────────────────────────────────
 function mpDetectServerInfo() {
-  // If served from a Node server (not file://), extract the host.
-  // Works for both LAN (http://192.168.x.x:3000) and a deployed
-  // internet server (https://your-app.example.com, no port needed).
   const loc = window.location;
-  if (loc.protocol === 'file:') return null; // opened directly as a local file, no server context
+  if (loc.protocol === 'file:') return null;
   const portPart = loc.port ? `:${loc.port}` : (loc.protocol === 'http:' ? ':3000' : '');
   return `${loc.hostname}${portPart}`;
 }
 
+// ── Connection ───────────────────────────────────────────────────────────────
 function mpConnect(ip, onOpen) {
-  const proto = (window.location.protocol === 'https:') ? 'wss://' : 'ws://';
-  const wsUrl = `${proto}${ip}`;
-  if (MP.ws) { try { MP.ws.close(); } catch(e) {} }
-  MP.ws = new WebSocket(wsUrl);
-  MP.serverIp = ip;
+  // Replace any old socket WITHOUT triggering its auto-reconnect
+  if (MP.ws) {
+    const old = MP.ws;
+    old.onclose = null; old.onerror = null; old.onmessage = null;
+    try { old.close(); } catch(e) {}
+  }
+  clearTimeout(MP.reconnectTimer);
+  MP.intentionalClose = false;
 
-  MP.ws.onopen = () => {
+  const clean = String(ip).replace(/^(https?|wss?):\/\//i,'').replace(/\/+$/,'');
+  const proto = (window.location.protocol === 'https:') ? 'wss://' : 'ws://';
+  let sock;
+  try { sock = new WebSocket(proto + clean); }
+  catch(e) { showMpStatus('❌', 'Cannot connect', 'That server address is not valid.'); return; }
+  MP.ws = sock;
+  MP.serverIp = clean;
+
+  sock.onopen = () => {
+    if (MP.ws !== sock) return;
     MP.connected = true;
-    document.getElementById('mpBadge').style.display = 'block';
+    MP.wakeAttempts = 0; // FIX: reset retry counter once we actually connect
     clearTimeout(MP.reconnectTimer);
     if (onOpen) onOpen();
   };
-
-  MP.ws.onmessage = (evt) => {
+  sock.onmessage = (evt) => {
+    if (MP.ws !== sock) return;
     let msg;
     try { msg = JSON.parse(evt.data); } catch(e) { return; }
     mpHandleMessage(msg);
   };
-
-  MP.ws.onclose = () => {
+  sock.onclose = () => {
+    if (MP.ws !== sock) return;
+    const wasConnected = MP.connected;
     MP.connected = false;
-    document.getElementById('mpBadge').style.display = 'none';
-    // Auto-reconnect
-    MP.reconnectTimer = setTimeout(() => {
-      if (MP.serverIp) mpConnect(MP.serverIp, null);
-    }, 3000);
+    mpUpdateBadge();
+    if (MP.intentionalClose || !MP.serverIp) return;
+    // Only keep retrying if we were actually in a room
+    if (MP.hostActive || MP.joined) {
+      MP.reconnectTimer = setTimeout(() => mpConnect(MP.serverIp, mpResume), 3000);
+      return;
+    }
+    if (!wasConnected) {
+      // FIX: On free hosts (e.g. Render) the server can be asleep and take up
+      // to ~50s to wake on the very first request. Previously this failed
+      // permanently on attempt #1 with no retry — that was the "can't join"
+      // bug. Now we retry a few times with an honest status message instead.
+      MP.wakeAttempts++;
+      if (MP.wakeAttempts <= 7) {
+        showMpModal(true);
+        showMpStatus('⏳', 'Connecting…',
+          MP.wakeAttempts === 1
+            ? 'If this is the first connection in a while, the server may need up to a minute to wake up.'
+            : 'Still trying (' + MP.wakeAttempts + '/7)… the server may be waking up from sleep.');
+        MP.reconnectTimer = setTimeout(() => mpConnect(MP.serverIp, onOpen), 7000);
+      } else {
+        MP.wakeAttempts = 0;
+        showMpModal(true);
+        showMpStatus('❌', 'Could not reach the server',
+          mpIsOnline() ? 'Check the link your teacher shared and your internet connection, then try again.'
+                       : 'Make sure you are on the same Wi-Fi/hotspot as your teacher and the address is correct.');
+      }
+    }
   };
+  sock.onerror = () => {};
+}
 
-  MP.ws.onerror = () => {};
+/* After a dropped connection comes back, put us back where we were */
+function mpResume(){
+  if (MP.role === 'host' && MP.hostActive && MP.roomId) {
+    mpSend({ type:'host_create', roomId:MP.roomId, reattach:true });
+  } else if (MP.role === 'player' && MP.joined && MP.roomId) {
+    mpSend({ type:'player_join', roomId:MP.roomId, playerName:MP.playerName, inGame:MP.gameActive });
+  }
+  mpUpdateBadge();
+}
+
+function mpDisconnect(){
+  MP.intentionalClose = true;
+  clearTimeout(MP.reconnectTimer);
+  if (MP.ws) { try { MP.ws.close(); } catch(e) {} }
+  MP.ws = null; MP.connected = false;
 }
 
 function mpSend(msg) {
   if (MP.ws && MP.ws.readyState === WebSocket.OPEN) {
     MP.ws.send(JSON.stringify(msg));
+    return true;
+  }
+  return false;
+}
+
+function mpUpdateBadge(){
+  const b = document.getElementById('mpBadge');
+  if (!b) return;
+  if (MP.role === 'player' && MP.joined) {
+    b.style.display = 'block';
+    b.textContent = (MP.connected ? '🌐 ' : '⚠ RECONNECTING · ') + (MP.playerName||'') + (MP.groupName ? ' · ' + MP.groupName : '');
+    b.style.borderColor = MP.connected ? 'var(--blue)' : 'var(--red)';
+  } else {
+    b.style.display = 'none';
   }
 }
 
 // ── Message router ───────────────────────────────────────────────────────────
 function mpHandleMessage(msg) {
-  if (msg.type === 'host_created') {
-    mpShowHostDashboard(msg.roomId, msg.info);
-  } else if (msg.type === 'group_joined' && MP.role === 'group') {
-    MP.groupId = msg.groupId;
-    MP.groupName = msg.groupName;
-    showMpStatus('✅', 'Connected!', `Group: ${msg.groupName} · Room: ${MP.roomId}`);
-    setTimeout(() => closeMpModal(), 1500);
-    // Show the group name badge in-game
-    document.getElementById('mpBadge').textContent = `🌐 ${msg.groupName}`;
-  } else if (msg.type === 'group_joined' && MP.role === 'host') {
-    hdUpdateGroups(msg.info);
-  } else if (msg.type === 'group_update') {
-    hdUpdateGroups(msg.info);
-  } else if (msg.type === 'group_disconnected') {
-    hdUpdateGroups(msg.info);
-  } else if (msg.type === 'host_message') {
-    mpHandleHostMessage(msg.payload);
-  } else if (msg.type === 'group_alert') {
-    hdOnAlert(msg);
-  } else if (msg.type === 'error') {
-    showMpStatus('❌', 'Error', msg.msg);
+  switch (msg.type) {
+    case 'host_created':  return mpOnHostCreated(msg);
+    case 'room_info':     return hdRender(msg.info);
+    case 'player_alert':  return hdOnAlert(msg);
+    case 'room_ok':       return mpOnRoomOk(msg);
+    case 'player_joined': return mpOnPlayerJoined(msg);
+    case 'host_message':  return mpHandleHostMessage(msg.payload);
+    case 'error':         return mpOnError(msg);
   }
 }
 
-function mpHandleHostMessage(payload) {
-  if (!payload) return;
+function mpOnError(msg){
+  const code = msg.code || '';
+  const text = msg.msg || 'Something went wrong.';
 
-  if (payload.cmd === 'start_game') {
-    const name = payload.groupName || MP.groupName || 'Group';
-    document.getElementById('playerName').value = name;
-
-    // Apply the case + question setup the teacher configured
-    const cfg = payload.config || null;
-    if (cfg && Array.isArray(cfg.questions) && cfg.questions.length) {
-      GS.questions = cfg.questions;
+  if (code === 'room_closed' || code === 'kicked' && MP.joined) {
+    const wasInRoom = MP.hostActive || MP.joined;
+    mpDisconnect();
+    mpResetState();
+    if (wasInRoom) {
+      MP.gameActive = false;
+      alert('🔌 ' + text);
+      closeMpModal();
+      showScreen('menuScreen');
+      return;
     }
-    MP.gameActive = true;
-    MP.focusLeaves = 0;
-
-    if (cfg && Array.isArray(cfg.values) && cfg.values.length) {
-      CC = { total: cfg.values.length, values: cfg.values };
-      startGameWithPool(cfg.values);
-    } else {
-      startGame();
-    }
-    setTimeout(()=>mpReportProgress('playing'), 400);
   }
 
-  if (payload.cmd === 'warn') {
-    alert('⚠️ MESSAGE FROM YOUR TEACHER\n\n' + (payload.text || 'Please stay on the game tab.'));
-  }
+  const back = { name_taken:'name', name_short:'name', room_not_found:'code', kicked:'code',
+                 group_exists:'host', group_name:'host', group_missing:'host', code_in_use:'host', bad_code:'host' }[code];
+  if (back) MP.statusBack = back;
+  showMpModal(true);
+  showMpStatus('❌', code === 'room_not_found' ? 'Code not found' : 'Cannot continue', text);
+}
 
-  if (payload.cmd === 'kick') {
-    MP.gameActive = false;
-    alert('🚪 You have been removed from the room by your teacher.\n\n' + (payload.text || ''));
-    try { MP.ws.close(); } catch(e) {}
-    location.reload();
-  }
+function mpResetState(){
+  MP.hostActive = false; MP.joined = false;
+  MP.roomId = null; MP.pendingRoomId = null;
+  MP.playerId = null; MP.gameActive = false;
+  MP.lastInfo = null; MP.viewingId = null;
+  mpUpdateBadge();
 }
 
 // ── UI helpers ───────────────────────────────────────────────────────────────
-function showMpModal() { document.getElementById('mpModal').classList.add('show'); }
+const MP_PANES = ['mpRolePane','mpHostPane','mpPlayerCodePane','mpPlayerNamePane','mpWaitPane','mpStatusPane'];
+function mpShowPane(id){
+  MP_PANES.forEach(p => { const el = document.getElementById(p); if (el) el.style.display = (p === id) ? 'block' : 'none'; });
+}
+
+/* Main-menu MULTIPLAYER button. keepPane=true leaves the current pane alone. */
+function showMpModal(keepPane) {
+  if (!keepPane) {
+    if (MP.role === 'host' && MP.hostActive) { showScreen('hostDashScreen'); return; }
+    if (MP.role === 'player' && MP.joined) { mpShowPane('mpWaitPane'); }
+    else { mpShowPane('mpRolePane'); }
+  }
+  document.getElementById('mpModal').classList.add('show');
+}
 function closeMpModal() { document.getElementById('mpModal').classList.remove('show'); }
+
+function showMpStatus(icon, text, sub) {
+  mpShowPane('mpStatusPane');
+  document.getElementById('mpStatusIcon').textContent = icon;
+  document.getElementById('mpStatusText').textContent = text;
+  document.getElementById('mpStatusSub').textContent = sub || '';
+  document.getElementById('mpStatusBack').style.display = (icon === '⏳') ? 'none' : 'block';
+}
+
+function mpStatusGoBack(){
+  const t = MP.statusBack;
+  if (t === 'host')      { mpShowPane('mpHostPane'); }
+  else if (t === 'code') { mpShowPane('mpPlayerCodePane'); }
+  else if (t === 'name') { mpShowPane('mpPlayerNamePane'); setTimeout(()=>{ const i=document.getElementById('mpPlayerName'); i.focus(); i.select(); },120); }
+  else                   { mpBackToRole(); }
+}
 
 function mpSelectRole(role) {
   MP.role = role;
-  document.getElementById('mpRolePane').style.display = 'none';
   const online = mpIsOnline();
   const detected = mpDetectServerInfo();
 
@@ -3688,329 +3973,309 @@ function mpSelectRole(role) {
     } else {
       serverInfoEl.innerHTML = '<span style="color:var(--dim)">Start the server first (<code style="color:var(--blue)">npm start</code>), then open the address it prints.</span>';
     }
-
     if (online) {
-      hostHint.textContent = 'Share the link below with your students. It works from any internet connection — they do not need to be on your network.';
+      hostHint.textContent = 'Share the link below with your students. It works from any internet connection.';
       hintEl.textContent = 'Students open this link in any browser, anywhere.';
     } else {
-      hostHint.textContent = "Turn on your Mobile Hotspot (or use your school Wi-Fi), have every group connect to the same network, then share the address and room code below.";
-      hintEl.textContent = 'Groups open this address on the same Wi-Fi network.';
+      hostHint.textContent = 'Turn on your Mobile Hotspot (or use school Wi-Fi), have every student connect to the same network, then share the address and room code.';
+      hintEl.textContent = 'Students open this address on the same Wi-Fi network.';
     }
 
-    // Auto-generate a fresh random room code every time the host pane opens
     mpGenerateCode();
     mpRefreshConfigSummary();
-    document.getElementById('mpHostPane').style.display = 'block';
+    mpShowPane('mpHostPane');
+    mpLoadGroupsList();
 
   } else {
     const wrap = document.getElementById('mpServerIpWrap');
     const ipHint = document.getElementById('mpServerIpHint');
     if (detected) {
       document.getElementById('mpServerIp').value = detected;
-      // Already on the right server — no need to make students retype it
       wrap.style.display = 'none';
     } else {
       wrap.style.display = 'block';
-      ipHint.textContent = online
-        ? 'Paste the link your teacher shared.'
-        : 'Ask your teacher for the address shown on their screen.';
+      ipHint.textContent = online ? 'Paste the link your teacher shared.' : 'Ask your teacher for the address shown on their screen.';
     }
-    document.getElementById('mpGroupPane').style.display = 'block';
-    setTimeout(()=>document.getElementById('mpGroupRoomId').focus(), 150);
+    mpShowPane('mpPlayerCodePane');
+    setTimeout(()=>document.getElementById('mpPlayerRoomId').focus(), 150);
   }
 }
 
 function mpBackToRole() {
-  document.getElementById('mpHostPane').style.display = 'none';
-  document.getElementById('mpGroupPane').style.display = 'none';
-  document.getElementById('mpStatusPane').style.display = 'none';
-  document.getElementById('mpRolePane').style.display = 'block';
-  MP.role = null;
+  if (!MP.hostActive && !MP.joined) { mpDisconnect(); MP.role = null; }
+  mpShowPane('mpRolePane');
 }
 
-function showMpStatus(icon, text, sub) {
-  document.getElementById('mpHostPane').style.display = 'none';
-  document.getElementById('mpGroupPane').style.display = 'none';
-  document.getElementById('mpRolePane').style.display = 'none';
-  document.getElementById('mpStatusPane').style.display = 'block';
-  document.getElementById('mpStatusIcon').textContent = icon;
-  document.getElementById('mpStatusText').textContent = text;
-  document.getElementById('mpStatusSub').textContent = sub || '';
+// ── Host: choose NEW or EXISTING group ──────────────────────────────────────
+function mpSetGroupMode(mode){
+  MP.groupMode = mode;
+  document.getElementById('mpGmNew').classList.toggle('active', mode === 'new');
+  document.getElementById('mpGmExisting').classList.toggle('active', mode === 'existing');
+  document.getElementById('mpGmNewPane').style.display = mode === 'new' ? 'block' : 'none';
+  document.getElementById('mpGmExistingPane').style.display = mode === 'existing' ? 'block' : 'none';
+  if (mode === 'new') setTimeout(()=>document.getElementById('mpNewGroupName').focus(), 80);
+}
+
+function mpLoadGroupsList(){
+  const sel = document.getElementById('mpExistingGroup');
+  const hint = document.getElementById('mpExistingHint');
+  const btnExisting = document.getElementById('mpGmExisting');
+
+  const fill = (groups) => {
+    MP.groupsList = groups;
+    if (!groups.length) {
+      sel.innerHTML = '<option value="">— no saved groups yet —</option>';
+      sel.disabled = true;
+      btnExisting.classList.add('disabled');
+      hint.textContent = 'No groups yet. Create a new group first — next time you can reuse it here.';
+      mpSetGroupMode('new');
+      return;
+    }
+    sel.disabled = false;
+    btnExisting.classList.remove('disabled');
+    const lastId = localStorage.getItem('dond_mp_lastgroup');
+    sel.innerHTML = groups.map(g =>
+      `<option value="${esc(g.id)}"${g.id===lastId?' selected':''}>${esc(g.name)} · ${g.playerCount} student${g.playerCount===1?'':'s'}${g.lastCode?(' · last code '+esc(g.lastCode)):''}</option>`
+    ).join('');
+    hint.textContent = "Students who join are added to this group's list. Their new scores are saved with its earlier games.";
+    mpSetGroupMode('existing');   // reuse a class by default — one click to switch to NEW
+  };
+
+  if (!mpHasServer()) {
+    sel.innerHTML = '<option value="">— start the server to see saved groups —</option>';
+    sel.disabled = true;
+    hint.textContent = 'Saved groups live on the server. Open the game from the address the server prints.';
+    mpSetGroupMode('new');
+    return;
+  }
+  sel.innerHTML = '<option value="">Loading groups…</option>';
+  fetch('/api/groups', { cache:'no-store' })
+    .then(r => r.json())
+    .then(d => fill((d && d.groups) || []))
+    .catch(() => {
+      sel.innerHTML = '<option value="">— could not load groups —</option>';
+      sel.disabled = true;
+      hint.textContent = 'The server did not answer. You can still create a new group.';
+      mpSetGroupMode('new');
+    });
 }
 
 // ── Host flow ────────────────────────────────────────────────────────────────
 function mpHostCreate() {
-  const roomId = (document.getElementById('mpHostRoomId').value.trim() || 'ROOM1').toUpperCase();
-  const detected = mpDetectServerInfo();
-  const serverIp = detected || 'localhost:3000';
-  MP.roomId = roomId;
+  const roomId = (document.getElementById('mpHostRoomId').value.trim() || '').toUpperCase();
+  if (!/^[A-Z0-9]{3,8}$/.test(roomId)) { alert('The room code must be 3–8 letters or numbers. Press 🎲 GENERATE RANDOM CODE.'); return; }
 
+  const msg = { type:'host_create', roomId, groupMode: MP.groupMode };
+  if (MP.groupMode === 'existing') {
+    const id = document.getElementById('mpExistingGroup').value;
+    if (!id) { alert('Choose a group from the list, or switch to CREATE NEW GROUP.'); return; }
+    msg.groupId = id;
+  } else {
+    const name = document.getElementById('mpNewGroupName').value.trim();
+    if (!name) { alert('Type a name for the new group (e.g. "Grade 9 – Rizal").'); document.getElementById('mpNewGroupName').focus(); return; }
+    msg.groupName = name;
+  }
+
+  const serverIp = mpDetectServerInfo() || 'localhost:3000';
+  MP.role = 'host';
+  MP.pendingRoomId = roomId;
+  MP.statusBack = 'host';
   showMpStatus('⏳', 'Creating room…', `Connecting to ${serverIp}`);
-  mpConnect(serverIp, () => {
-    mpSend({ type: 'host_create', roomId });
-  });
+  mpConnect(serverIp, () => mpSend(msg));
 }
 
-function mpShowHostDashboard(roomId, info) {
-  document.getElementById('mpModal').classList.remove('show');
-  MP.roomId = roomId;
-  document.getElementById('hdRoomInfo').textContent = `Room: ${roomId}  ·  Waiting for groups to join…`;
-  hdUpdateGroups(info);
+function mpOnHostCreated(msg){
+  if (MP.role !== 'host') return;
+  MP.hostActive = true;
+  MP.roomId = msg.roomId;
+  MP.pendingRoomId = null;
+  if (msg.group) {
+    MP.groupId = msg.group.id;
+    MP.groupName = msg.group.name;
+    try { localStorage.setItem('dond_mp_lastgroup', msg.group.id); } catch(e) {}
+  }
+  if (msg.reattached) { hdRender(msg.info); return; }
+  closeMpModal();
+  MP.alerts = [];
+  hdRenderAlerts();
+  hdRender(msg.info);
   showScreen('hostDashScreen');
 }
 
-function hdStartAll() {
-  // Send start signal + the teacher's case/question setup to all groups
-  hdStartAllWithConfig();
+function hdEndRoom(){
+  if (!confirm('End this room?\n\nStudents still playing will be disconnected. Scores already finished are saved in the group.')) return;
+  mpSend({ type:'host_end' });
+  setTimeout(() => { mpDisconnect(); mpResetState(); MP.role = null; showScreen('menuScreen'); }, 150);
 }
 
-// ── Group flow ───────────────────────────────────────────────────────────────
-function mpGroupJoin() {
-  const serverIp = (document.getElementById('mpServerIp').value.trim()) || mpDetectServerInfo();
-  const roomId   = (document.getElementById('mpGroupRoomId').value.trim() || '').toUpperCase();
-  const groupName= document.getElementById('mpGroupName').value.trim() || 'Group';
-  const membersRaw = (document.getElementById('mpGroupMembers').value || '').trim();
-  const members = membersRaw
-    ? membersRaw.split(',').map(s=>s.trim()).filter(Boolean)
-    : [];
+function hdStartAll() { hdStartAllWithConfig(); }
 
+// ── Student flow ────────────────────────────────────────────────────────────
+function mpPlayerCheckCode(){
+  const serverIp = (document.getElementById('mpServerIp').value.trim()) || mpDetectServerInfo();
+  const roomId = (document.getElementById('mpPlayerRoomId').value.trim() || '').toUpperCase();
   if (!serverIp) { alert('Please enter the server address from your teacher.'); return; }
   if (!roomId)   { alert('Please enter the ROOM CODE your teacher gave you.'); return; }
 
-  MP.roomId = roomId;
-  MP.groupName = groupName;
-  MP.members = members;
-
-  showMpStatus('⏳', 'Joining room…', `Room ${roomId}`);
-  mpConnect(serverIp, () => {
-    mpSend({ type: 'group_join', roomId, groupId: null, groupName, members });
-  });
+  MP.role = 'player';
+  MP.pendingRoomId = roomId;
+  MP.statusBack = 'code';
+  showMpStatus('⏳', 'Checking code…', `Room ${roomId}`);
+  const send = () => mpSend({ type:'room_check', roomId });
+  if (MP.connected && MP.serverIp === serverIp.replace(/^(https?|wss?):\/\//i,'').replace(/\/+$/,'')) send();
+  else mpConnect(serverIp, send);
 }
 
-// ── Host dashboard rendering ─────────────────────────────────────────────────
-function hdUpdateGroups(info) {
-  if (!info || !info.groups) return;
-  MP.lastInfo = info;
-  // Archive any group that has finished, so it appears in HISTORY as a group file
-  try {
-    info.groups.forEach(g => {
-      if ((g.status === 'done' || g.status === 'deal') && g.finalValue != null) {
-        mpSaveGroupFile({
-          roomId: MP.roomId, groupName: g.name, members: g.members || [],
-          date: new Date().toLocaleDateString(),
-          time: new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}),
-          datetime: new Date().toISOString(),
-          caseVal: g.caseValue || '—', deal: g.dealValue || 'No Deal',
-          final: g.finalValue, pts: g.pts || '—',
-          ptsNum: parseFloat(String(g.pts||'0')) || 0,
-          errors: g.errors || 0, winner: g.winner || '—'
-        });
-      }
-    });
-  } catch(e) { console.warn('archive failed', e); }
-  const grid = document.getElementById('hdGroupsGrid');
-  grid.innerHTML = '';
+function mpOnRoomOk(msg){
+  if (MP.role !== 'player') return;
+  MP.pendingRoomId = msg.roomId;
+  MP.groupName = msg.groupName || '';
+  document.getElementById('mpJoinGroupName').textContent = MP.groupName || 'Group';
+  document.getElementById('mpJoinRoomCode').textContent = 'Room code ' + msg.roomId;
+  const nameEl = document.getElementById('mpPlayerName');
+  if (!nameEl.value) nameEl.value = localStorage.getItem('dond_mp_myname') || '';
+  mpShowPane('mpPlayerNamePane');
+  setTimeout(()=>{ nameEl.focus(); nameEl.select(); }, 120);
+}
 
-  if (info.groups.length === 0) {
-    grid.innerHTML = '<div style="color:var(--dim);font-size:0.9rem;text-align:center;grid-column:1/-1;padding:20px;">No groups connected yet. Share the server URL with your groups.</div>';
+function mpPlayerBackToCode(){ mpShowPane('mpPlayerCodePane'); }
+
+function mpPlayerJoin(){
+  const name = document.getElementById('mpPlayerName').value.trim().replace(/\s+/g,' ');
+  if (name.length < 2) { alert('Please type your name.'); return; }
+  if (!MP.pendingRoomId) { mpShowPane('mpPlayerCodePane'); return; }
+  MP.statusBack = 'name';
+  showMpStatus('⏳', 'Joining…', `${name} → ${MP.groupName || 'group'}`);
+  const send = () => mpSend({ type:'player_join', roomId:MP.pendingRoomId, playerName:name });
+  if (MP.connected) send(); else mpConnect(MP.serverIp || mpDetectServerInfo(), send);
+}
+
+function mpOnPlayerJoined(msg){
+  if (MP.role !== 'player') return;
+  const rejoin = MP.joined;
+  MP.joined = true;
+  MP.roomId = msg.roomId;
+  MP.pendingRoomId = null;
+  MP.playerId = msg.playerId;
+  MP.playerName = msg.playerName;
+  MP.groupName = msg.groupName;
+  try { localStorage.setItem('dond_mp_myname', msg.playerName); } catch(e) {}
+  mpUpdateBadge();
+  if (rejoin) { if (MP.gameActive) mpReportProgress('playing'); return; }
+
+  document.getElementById('mpWaitName').textContent = msg.playerName;
+  document.getElementById('mpWaitGroup').textContent = '👥 ' + msg.groupName + ' · Room ' + msg.roomId;
+  mpShowPane('mpWaitPane');
+}
+
+function mpLeaveRoom(){
+  if (!confirm('Leave the room?')) return;
+  mpDisconnect();
+  mpResetState();
+  MP.role = null;
+  closeMpModal();
+}
+
+function mpHandleHostMessage(payload) {
+  if (!payload || MP.role !== 'player') return;
+
+  if (payload.cmd === 'start_game') {
+    const cfg = payload.config || null;
+    if (MP.gameActive && !confirm('Your teacher restarted the game for everyone.\n\nStart a new game now? (Your current game will end.)')) return;
+
+    try { clearQuestionTimer(); } catch(e) {}
+    document.querySelectorAll('.modal-ov.show').forEach(m => m.classList.remove('show'));
+    try { dismissTabWarning(); } catch(e) {}
+    const wb = document.getElementById('winnerBanner'); if (wb) wb.style.display = 'none';
+    const rb = document.getElementById('restartBtn'); if (rb) rb.style.display = 'none';
+
+    document.getElementById('playerName').value = MP.playerName || 'Student';
+    if (cfg && Array.isArray(cfg.questions) && cfg.questions.length) GS.questions = cfg.questions;
+
+    MP.gameActive = true;
+    MP.focusLeaves = 0;
+    MP.gameId = 'g' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+
+    if (cfg && Array.isArray(cfg.values) && cfg.values.length) {
+      CC = { total: cfg.values.length, values: cfg.values };
+      startGameWithPool(cfg.values);
+    } else {
+      startGame();
+    }
+    setTimeout(() => mpReportProgress('playing', { newGame:true }), 300);
   }
 
-  info.groups.forEach(g => {
-    const statusClass = {
-      playing: 'gc-playing',
-      deal: 'gc-deal',
-      done: 'gc-done',
-      disconnected: 'gc-disconnected'
-    }[g.status] || 'gc-playing';
-
-    const statusText = {
-      playing: '🎮 PLAYING',
-      deal: '🤝 DEAL MADE',
-      done: '🏆 FINISHED',
-      disconnected: '⚡ DISCONNECTED'
-    }[g.status] || '🎮 PLAYING';
-
-    const valLine = g.finalValue != null
-      ? `<div class="hd-gc-val" style="color:var(--gold)">${esc(g.finalValue)}</div><div style="font-size:0.7rem;color:var(--dim)">FINAL VALUE · ${esc(g.pts||'')}</div>`
-      : g.dealValue != null
-        ? `<div class="hd-gc-val" style="color:var(--green)">${esc(g.dealValue)}</div><div style="font-size:0.7rem;color:var(--dim)">DEAL VALUE</div>`
-        : `<div style="font-size:0.75rem;color:var(--dim);margin-top:8px;">In progress…</div>`;
-
-    // Live progress bar
-    const opened = g.opened || 0;
-    const totalC = g.totalCases || 0;
-    const pctDone = totalC > 0 ? Math.round((opened / totalC) * 100) : 0;
-    const progLine = totalC > 0
-      ? `<div class="hd-prog-wrap"><div class="hd-prog-bar" style="width:${pctDone}%"></div></div>
-         <div class="hd-prog-txt">${opened}/${totalC} cases opened${g.round?(' · Round '+g.round):''}</div>`
-      : `<div class="hd-prog-txt" style="opacity:0.6">Waiting to start…</div>`;
-
-    const alertBadge = (g.alerts && g.alerts > 0)
-      ? `<div class="hd-alert-badge">🚨 Left tab ${g.alerts}×</div>` : '';
-
-    const membersLine = (g.members && g.members.length)
-      ? `<div class="hd-gc-members">${esc(g.members.join(', '))}</div>` : '';
-
-    const card = document.createElement('div');
-    card.className = `hd-group-card ${statusClass}`;
-    card.innerHTML = `
-      <div class="hd-gc-name">👥 ${esc(g.name)}</div>
-      ${membersLine}
-      <div class="hd-gc-status" style="color:var(--blue)">${statusText}</div>
-      ${progLine}
-      <div style="font-size:0.7rem;color:var(--red);margin-top:4px;">❌ ${g.errors||0} errors</div>
-      ${alertBadge}
-      ${valLine}
-      <div style="display:flex;gap:6px;margin-top:10px;flex-wrap:wrap;">
-        <button class="hd-mini-btn" onclick="mpOpenView('${esc(g.name).replace(/'/g,"\\'")}')">👁 VIEW</button>
-        <button class="hd-mini-btn" onclick="hdWarnGroup('${esc(g.name).replace(/'/g,"\\'")}')">⚠ WARN</button>
-        <button class="hd-mini-btn danger" onclick="hdKickGroup('${esc(g.name).replace(/'/g,"\\'")}')">🚪 KICK</button>
-      </div>
-    `;
-    grid.appendChild(card);
-  });
-
-  // Keep the live view modal in sync
-  if (MP.viewingGroup) mpRenderView();
-
-  // Update scoreboard
-  hdRenderScoreboard(info.groups);
-}
-
-function hdRenderScoreboard(groups) {
-  const el = document.getElementById('hdScoreboard');
-  const done = groups.filter(g => g.status === 'done' || g.status === 'deal');
-  if (done.length === 0) { el.textContent = 'Waiting for groups to finish…'; return; }
-
-  const rows = [...groups].sort((a, b) => {
-    const av = a.finalValue ? parseFloat(a.finalValue.replace(/[^0-9.]/g,'')) : 0;
-    const bv = b.finalValue ? parseFloat(b.finalValue.replace(/[^0-9.]/g,'')) : 0;
-    return bv - av;
-  }).map((g, i) => `
-    <tr>
-      <td style="color:var(--gold);font-family:var(--font-head);font-size:0.8rem">#${i+1}</td>
-      <td><strong>${g.name}</strong></td>
-      <td style="color:var(--blue);font-family:var(--font-head);font-size:0.78rem">${g.dealValue||'—'}</td>
-      <td style="color:var(--gold);font-family:var(--font-head);font-size:0.78rem">${g.finalValue||'—'}</td>
-      <td style="color:var(--green);font-size:0.78rem">${g.pts||'—'}</td>
-      <td style="color:var(--red)">${g.errors||0}</td>
-    </tr>
-  `).join('');
-
-  el.innerHTML = `<table style="width:100%;border-collapse:collapse;">
-    <thead><tr>
-      <th style="text-align:left;color:var(--dim);font-size:0.7rem;padding:6px 8px">#</th>
-      <th style="text-align:left;color:var(--dim);font-size:0.7rem;padding:6px 8px">GROUP</th>
-      <th style="text-align:left;color:var(--dim);font-size:0.7rem;padding:6px 8px">DEAL</th>
-      <th style="text-align:left;color:var(--dim);font-size:0.7rem;padding:6px 8px">FINAL VALUE</th>
-      <th style="text-align:left;color:var(--dim);font-size:0.7rem;padding:6px 8px">PTS</th>
-      <th style="text-align:left;color:var(--dim);font-size:0.7rem;padding:6px 8px">ERR</th>
-    </tr></thead>
-    <tbody>${rows}</tbody>
-  </table>`;
-}
-
-// ── Hook into game events to report to host ──────────────────────────────────
-
-// Report progress whenever a case resolves or a new round begins
-if (typeof afterAnswer === 'function') {
-  const _origAfterAnswer = afterAnswer;
-  window.afterAnswer = function(){
-    _origAfterAnswer.apply(this, arguments);
-    try { mpReportProgress('playing'); } catch(e) {}
-  };
-}
-if (typeof advanceRound === 'function') {
-  const _origAdvanceRound = advanceRound;
-  window.advanceRound = function(){
-    _origAdvanceRound.apply(this, arguments);
-    try { mpReportProgress('playing'); } catch(e) {}
-  };
-}
-if (typeof showBanker === 'function') {
-  const _origShowBanker = showBanker;
-  window.showBanker = function(){
-    _origShowBanker.apply(this, arguments);
-    try { mpReportProgress('playing'); } catch(e) {}
-  };
-}
-if (typeof selectPlayerCase === 'function') {
-  const _origSelectCase = selectPlayerCase;
-  window.selectPlayerCase = function(){
-    _origSelectCase.apply(this, arguments);
-    try { mpReportProgress('playing'); } catch(e) {}
-  };
-}
-
-// Patch playerDeal to report
-const _origPlayerDeal = playerDeal;
-window.playerDeal = function() {
-  if(!canAct()) return;
-  if (MP.role === 'group' && MP.connected) {
-    mpSend({
-      type: 'group_update',
-      roomId: MP.roomId,
-      groupId: MP.groupId,
-      status: 'deal',
-      dealValue: fmtVal(GS.bankerOffer),
-      errors: GS.wrongCount,
-      opened: (GS.openedCases && GS.openedCases.length) || 0,
-      totalCases: GS.totalCases || 0,
-      members: MP.members || [],
-    });
+  if (payload.cmd === 'warn') {
+    alert('⚠️ MESSAGE FROM YOUR TEACHER\n\n' + (payload.text || 'Please stay on the game tab.'));
   }
-  _origPlayerDeal();
-};
 
-// Patch acceptFinalDeal
-const _origAcceptFinal = acceptFinalDeal;
-window.acceptFinalDeal = function() {
-  if(!canAct()) return;
-  if (MP.role === 'group' && MP.connected) {
-    mpSend({
-      type: 'group_update',
-      roomId: MP.roomId,
-      groupId: MP.groupId,
-      status: 'deal',
-      dealValue: fmtVal(GS.bankerOffer),
-      errors: GS.wrongCount,
-      opened: (GS.openedCases && GS.openedCases.length) || 0,
-      totalCases: GS.totalCases || 0,
-      members: MP.members || [],
-    });
-  }
-  _origAcceptFinal();
-};
-
-// Patch showResult to report final outcome
-const _origShowResult = showResult;
-window.showResult = function(caseVal) {
-  _origShowResult(caseVal);
-  if (MP.role === 'group' && MP.connected) {
-    const finalVal = GS.dealMade ? GS.dealValue : caseVal;
-    mpSend({
-      type: 'group_update',
-      roomId: MP.roomId,
-      groupId: MP.groupId,
-      status: 'done',
-      finalValue: fmtVal(finalVal),
-      dealValue: GS.dealMade ? fmtVal(GS.dealValue) : 'No Deal',
-      caseValue: fmtVal(caseVal),
-      pts: fmtPts(finalVal),
-      errors: GS.wrongCount,
-      opened: (GS.openedCases && GS.openedCases.length) || 0,
-      totalCases: GS.totalCases || 0,
-      members: MP.members || [],
-    });
+  if (payload.cmd === 'kick') {
     MP.gameActive = false;
+    mpDisconnect();
+    alert('🚪 You have been removed from the room by your teacher.' + (payload.text ? '\n\n' + payload.text : ''));
+    location.reload();
   }
-};
+}
 
+// ── Student: report progress / final result ─────────────────────────────────
+function mpReportProgress(statusOverride, extra){
+  if (MP.role !== 'player' || !MP.joined || !MP.connected) return;
+  const opened = (GS.openedCases && GS.openedCases.length) || 0;
+  mpSend(Object.assign({
+    type: 'player_update',
+    status: statusOverride || 'playing',
+    opened,
+    totalCases: GS.totalCases || 0,
+    round: (GS.roundIdx || 0) + 1,
+    errors: GS.wrongCount || 0,
+    offer: (GS.bankerOffer != null) ? fmtVal(GS.bankerOffer) : null,
+  }, extra || {}));
+}
+
+function mpReportResult(rec){
+  if (MP.role !== 'player' || !MP.joined) return;
+  MP.gameActive = false;
+  const payload = {
+    type: 'player_result',
+    gameId: MP.gameId || ('g' + Date.now().toString(36)),
+    caseVal: rec.caseVal, deal: rec.deal, final: rec.final,
+    pts: rec.pts, ptsNum: rec.ptsNum, errors: rec.errors, winner: rec.winner,
+  };
+  if (!mpSend(payload)) {
+    // Not connected right now → retry once we're back
+    let tries = 0;
+    const t = setInterval(() => { if (mpSend(payload) || ++tries > 40) clearInterval(t); }, 3000);
+  }
+}
+
+// Report progress whenever a case resolves, a round advances, or the banker calls
+['afterAnswer','advanceRound','showBanker','selectPlayerCase'].forEach(fn => {
+  if (typeof window[fn] === 'function') {
+    const orig = window[fn];
+    window[fn] = function(){
+      const r = orig.apply(this, arguments);
+      try { mpReportProgress('playing'); } catch(e) {}
+      return r;
+    };
+  }
+});
+
+// Deal accepted → tell the teacher right away
+['playerDeal','acceptFinalDeal'].forEach(fn => {
+  if (typeof window[fn] === 'function') {
+    const orig = window[fn];
+    window[fn] = function(){
+      if (!canAct()) return;
+      try {
+        if (MP.role === 'player' && MP.joined) mpReportProgress('deal', { dealValue: fmtVal(GS.bankerOffer) });
+      } catch(e) {}
+      return orig.apply(this, arguments);
+    };
+  }
+});
 
 /* =============================================
-   ROOM CODE GENERATOR
-   Uses characters that are hard to misread aloud
-   (no O/0, I/1, etc.) so students type it right first time.
+   ROOM CODE GENERATOR (no O/0, I/1 — easy to read aloud)
 ============================================= */
 function mpGenerateCode(){
   const chars='ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
@@ -4024,61 +4289,39 @@ function mpGenerateCode(){
 function mpCopyServerLink(){
   const detected=mpDetectServerInfo();
   if(!detected){ alert('Start the server first, then reopen this screen.'); return; }
-  const code=(document.getElementById('mpHostRoomId').value||'').trim();
-  const link=location.protocol+'//'+detected+'/';
-  const text=code ? (link+'\n\nRoom code: '+code) : link;
+  const code=MP.roomId || (document.getElementById('mpHostRoomId').value||'').trim();
+  // FIX: embed the room code as ?code=XXXXXX so the link is a true one-click
+  // auto-join — students land straight in the waiting room and just type
+  // their name, instead of landing on the plain homepage.
+  const link=location.protocol+'//'+detected+'/'+(code ? ('?code='+encodeURIComponent(code)) : '');
+  const text=code ? (link+'\n\nOr give them the code by hand: '+code) : link;
   if(navigator.clipboard&&navigator.clipboard.writeText){
-    navigator.clipboard.writeText(text).then(()=>alert('✅ Copied!\n\n'+text),()=>prompt('Copy this:',text));
+    navigator.clipboard.writeText(text).then(()=>alert('✅ Copied! Students who open this link join automatically:\n\n'+text),()=>prompt('Copy this:',text));
   }else{
     prompt('Copy this:',text);
   }
 }
 
 /* =============================================
-   HOST: CASE / QUESTION CONFIG SHARED WITH GROUPS
+   HOST: CASE / QUESTION CONFIG SHARED WITH STUDENTS
 ============================================= */
 function mpRefreshConfigSummary(){
   const el=document.getElementById('mpConfigSummary');
   if(!el) return;
-  const cases = (MP.hostConfig && MP.hostConfig.values)
-    ? MP.hostConfig.values.length + ' cases'
-    : '30 cases (default)';
-  const qs = (GS.questions && GS.questions.length)
-    ? GS.questions.length + ' questions'
-    : 'built-in questions';
+  const cases = (MP.hostConfig && MP.hostConfig.values) ? MP.hostConfig.values.length + ' cases' : '30 cases (default)';
+  const qs = (GS.questions && GS.questions.length) ? GS.questions.length + ' questions' : 'built-in questions';
   el.textContent = 'Using: ' + cases + ' · ' + qs;
 }
 
-/* Opens the existing Custom Cases screen in "host setup" mode. */
 function mpOpenCaseConfig(){
   MP_CONFIG_MODE = true;
   closeMpModal();
   ccInitDefaults();
   const btn=document.getElementById('ccStartBtn');
-  if(btn) btn.textContent='✓ USE THESE CASES FOR ALL GROUPS';
+  if(btn) btn.textContent='✓ USE THESE CASES FOR ALL STUDENTS';
   showScreen('customCasesScreen');
 }
 let MP_CONFIG_MODE = false;
-
-/* =============================================
-   GROUP: REPORT LIVE PROGRESS TO THE TEACHER
-============================================= */
-function mpReportProgress(statusOverride){
-  if(MP.role!=='group'||!MP.connected) return;
-  const opened=(GS.openedCases&&GS.openedCases.length)||0;
-  mpSend({
-    type:'group_update',
-    roomId:MP.roomId,
-    groupId:MP.groupId,
-    status: statusOverride || 'playing',
-    opened: opened,
-    totalCases: GS.totalCases||0,
-    round: (GS.roundIdx||0)+1,
-    errors: GS.wrongCount||0,
-    offer: (GS.bankerOffer!=null)?fmtVal(GS.bankerOffer):null,
-    members: MP.members||[]
-  });
-}
 
 /* =============================================
    TAB-LEAVE DETECTION (student) + TEACHER ALERT
@@ -4087,149 +4330,240 @@ function dismissTabWarning(){
   document.getElementById('tabWarnOverlay').classList.remove('show');
 }
 
+let _mpLastLeaveAt = 0;
 function mpOnTabLeave(){
-  if(MP.role!=='group'||!MP.gameActive) return;
+  if (MP.role !== 'player' || !MP.gameActive) return;
+  const now = Date.now();
+  if (now - _mpLastLeaveAt < 800) return;   // blur + visibilitychange fire together
+  _mpLastLeaveAt = now;
   MP.focusLeaves++;
 
-  // Warn the student on screen
-  const ov=document.getElementById('tabWarnOverlay');
-  document.getElementById('twCount').textContent =
-    'Times you left this tab: '+MP.focusLeaves;
-  ov.classList.add('show');
+  document.getElementById('twCount').textContent = 'Times you left this tab: ' + MP.focusLeaves;
+  document.getElementById('tabWarnOverlay').classList.add('show');
 
-  // Notify the teacher
-  if(MP.connected){
-    mpSend({
-      type:'group_alert',
-      roomId:MP.roomId,
-      groupId:MP.groupId,
-      groupName:MP.groupName,
-      alertType:'tab_leave',
-      count:MP.focusLeaves,
-      at:new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})
-    });
-  }
+  mpSend({
+    type: 'player_alert',
+    alertType: 'tab_leave',
+    at: new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'})
+  });
 }
 
-document.addEventListener('visibilitychange', ()=>{
-  if(document.hidden) mpOnTabLeave();
-});
-window.addEventListener('blur', ()=>{
-  // Only count a real tab/app switch, not clicking inside the page
-  setTimeout(()=>{ if(document.hidden) mpOnTabLeave(); }, 120);
-});
+document.addEventListener('visibilitychange', () => { if (document.hidden) mpOnTabLeave(); });
+window.addEventListener('blur', () => { setTimeout(() => { if (document.hidden) mpOnTabLeave(); }, 120); });
 
 /* =============================================
-   HOST: ALERT FEED
+   HOST DASHBOARD — one card per STUDENT
+============================================= */
+const MP_STATUS = {
+  waiting:      { cls:'gc-waiting',      text:'⏳ WAITING',      short:'Waiting' },
+  playing:      { cls:'gc-playing',      text:'🎮 PLAYING',      short:'Playing' },
+  deal:         { cls:'gc-deal',         text:'🤝 DEAL MADE',    short:'Deal made' },
+  done:         { cls:'gc-done',         text:'🏆 FINISHED',     short:'Finished' },
+  disconnected: { cls:'gc-disconnected', text:'⚡ DISCONNECTED', short:'Disconnected' },
+};
+const mpJsArg = (s) => "'" + String(s).replace(/\\/g,'\\\\').replace(/'/g,"\\'") + "'";
+
+function hdRender(info){
+  if (!info || !Array.isArray(info.players)) return;
+  MP.lastInfo = info;
+
+  const players = [...info.players].sort((a,b) => String(a.name).localeCompare(String(b.name), undefined, {sensitivity:'base'}));
+  const count = (s) => players.filter(p => p.status === s).length;
+
+  document.getElementById('hdGroupTitle').textContent = '👥 ' + (info.groupName || MP.groupName || 'Group');
+  document.getElementById('hdRoomInfo').textContent = 'Room ' + info.roomId + (info.started ? ' · game started' : ' · waiting for you to press START');
+  document.getElementById('hdBigCode').textContent = info.roomId;
+  document.getElementById('hdCntJoined').textContent = players.length;
+  document.getElementById('hdCntPlaying').textContent = count('playing') + count('deal');
+  document.getElementById('hdCntDone').textContent = count('done');
+  document.getElementById('hdCntRoster').textContent = info.rosterCount || 0;
+
+  const grid = document.getElementById('hdGroupsGrid');
+  if (players.length === 0) {
+    grid.innerHTML = '<div style="color:var(--dim);font-size:0.9rem;text-align:center;grid-column:1/-1;padding:20px;line-height:1.7;">No students yet.<br>Students open the game → <strong style="color:var(--blue)">MULTIPLAYER</strong> → <strong style="color:var(--blue)">I AM A STUDENT</strong> → type code <strong style="color:var(--gold)">' + esc(info.roomId) + '</strong> → type their name.</div>';
+  } else {
+    grid.innerHTML = players.map(p => {
+      const st = MP_STATUS[p.status] || MP_STATUS.waiting;
+      const totalC = p.totalCases || 0, opened = p.opened || 0;
+      const pct = totalC > 0 ? Math.round(opened / totalC * 100) : 0;
+      const prog = totalC > 0
+        ? `<div class="hd-prog-wrap"><div class="hd-prog-bar" style="width:${pct}%"></div></div>
+           <div class="hd-prog-txt">${opened}/${totalC} cases${p.round ? ' · Round ' + p.round : ''}</div>`
+        : `<div class="hd-prog-txt" style="opacity:0.6">${p.status === 'waiting' ? 'Waiting for START…' : '—'}</div>`;
+      const score = p.pts
+        ? `<div class="hd-gc-val" style="color:var(--green)">${esc(p.pts)}</div><div style="font-size:0.66rem;color:var(--dim)">FINAL ${esc(p.finalValue||'')}${p.gamesDone>1?(' · game '+p.gamesDone):''}</div>`
+        : p.dealValue ? `<div class="hd-gc-val" style="color:var(--green);font-size:1rem;">${esc(p.dealValue)}</div><div style="font-size:0.66rem;color:var(--dim)">DEAL — opening own case…</div>`
+        : p.offer ? `<div style="font-size:0.7rem;color:var(--dim);margin-top:6px;">Offer: <span style="color:var(--green)">${esc(p.offer)}</span></div>` : '';
+      const alert = p.alerts > 0 ? `<div class="hd-alert-badge">🚨 Left tab ${p.alerts}×</div>` : '';
+      return `<div class="hd-group-card ${st.cls}">
+        <div class="hd-gc-name">👤 ${esc(p.name)}</div>
+        <div class="hd-gc-status">${st.text}</div>
+        ${prog}
+        <div style="font-size:0.68rem;color:var(--red);margin-top:4px;">❌ ${p.errors||0} wrong</div>
+        ${alert}
+        ${score}
+        <div style="display:flex;gap:5px;margin-top:10px;flex-wrap:wrap;">
+          <button class="hd-mini-btn" onclick="mpOpenView(${mpJsArg(p.id)})">👁 VIEW</button>
+          <button class="hd-mini-btn" onclick="hdWarnPlayer(${mpJsArg(p.id)})">⚠ WARN</button>
+          <button class="hd-mini-btn danger" onclick="hdKickPlayer(${mpJsArg(p.id)})">🚪 KICK</button>
+        </div>
+      </div>`;
+    }).join('');
+  }
+
+  if (MP.viewingId) mpRenderView();
+  hdRenderScoreboard(players);
+}
+
+function hdRenderScoreboard(players){
+  const el = document.getElementById('hdScoreboard');
+  if (!players.length) { el.textContent = 'Waiting for students to join…'; return; }
+
+  const ranked = [...players].sort((a,b) => {
+    const ad = a.ptsNum != null, bd = b.ptsNum != null;
+    if (ad !== bd) return ad ? -1 : 1;
+    if (ad) return (b.ptsNum - a.ptsNum) || ((a.errors||0) - (b.errors||0));
+    return ((b.opened||0) - (a.opened||0)) || String(a.name).localeCompare(String(b.name));
+  });
+  let rank = 0;
+  const rows = ranked.map(p => {
+    const finished = p.ptsNum != null;
+    if (finished) rank++;
+    const st = MP_STATUS[p.status] || MP_STATUS.waiting;
+    return `<tr class="${finished && rank===1 ? 'lb-top' : ''}">
+      <td style="color:var(--gold);font-family:var(--font-head);font-size:0.8rem">${finished ? medal(rank-1) : '—'}</td>
+      <td><strong>${esc(p.name)}</strong></td>
+      <td style="font-size:0.72rem;color:var(--dim)">${st.short}</td>
+      <td style="font-size:0.72rem">${p.totalCases ? (p.opened||0)+'/'+p.totalCases : '—'}</td>
+      <td style="color:var(--blue);font-family:var(--font-head);font-size:0.74rem">${esc(p.dealValue||'—')}</td>
+      <td style="color:var(--gold);font-family:var(--font-head);font-size:0.74rem">${esc(p.finalValue||'—')}</td>
+      <td style="color:var(--green);font-family:var(--font-head);font-size:0.78rem">${esc(p.pts||'—')}</td>
+      <td style="color:var(--red)">${p.errors||0}</td>
+      <td style="color:${p.alerts?'var(--red)':'var(--dim)'}">${p.alerts||0}</td>
+    </tr>`;
+  }).join('');
+
+  el.innerHTML = `<table class="hist-table" style="width:100%;">
+    <thead><tr><th>#</th><th>STUDENT</th><th>STATUS</th><th>CASES</th><th>DEAL</th><th>FINAL</th><th>SCORE</th><th>ERR</th><th>LEFT TAB</th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table>`;
+}
+
+/* =============================================
+   HOST: ALERT FEED + WARN / KICK (per student)
 ============================================= */
 function hdOnAlert(msg){
   MP.alerts.unshift({
-    group: msg.groupName || 'Group',
+    name: msg.playerName || 'Student',
     count: msg.count || 1,
     at: msg.at || new Date().toLocaleTimeString([], {hour:'2-digit', minute:'2-digit'}),
-    type: msg.alertType || 'tab_leave'
   });
   MP.alerts = MP.alerts.slice(0, 50);
   hdRenderAlerts();
-
-  // Audible + visual nudge so the teacher notices
-  try { if(typeof playSfx==='function') playSfx('WRONG'); } catch(e){}
+  try { if (typeof sfx === 'function') sfx('WRONG', 0.5); } catch(e) {}
 }
 
 function hdRenderAlerts(){
-  const panel=document.getElementById('hdAlertPanel');
-  const list=document.getElementById('hdAlertList');
-  if(!panel||!list) return;
-  if(MP.alerts.length===0){ panel.style.display='none'; return; }
-  panel.style.display='block';
-  list.innerHTML=MP.alerts.map(a=>`
+  const panel = document.getElementById('hdAlertPanel');
+  const list = document.getElementById('hdAlertList');
+  if (!panel || !list) return;
+  if (MP.alerts.length === 0) { panel.style.display = 'none'; return; }
+  panel.style.display = 'block';
+  list.innerHTML = MP.alerts.map(a => `
     <div class="hd-alert-row">
-      <span><strong style="color:var(--red)">${esc(a.group)}</strong> left the game tab</span>
+      <span><strong style="color:var(--red)">${esc(a.name)}</strong> left the game tab</span>
       <span style="color:var(--dim);font-size:0.7rem;">${esc(a.at)} · ${a.count}× total</span>
-    </div>
-  `).join('');
+    </div>`).join('');
+}
+function hdClearAlerts(){ MP.alerts = []; hdRenderAlerts(); }
+
+function mpPlayerById(id){
+  return (MP.lastInfo && MP.lastInfo.players || []).find(p => p.id === id) || null;
 }
 
-function hdClearAlerts(){ MP.alerts=[]; hdRenderAlerts(); }
-
-function hdWarnGroup(name){
-  const text=prompt('Message to send to "'+name+'":','Please stay on the game tab.');
-  if(text===null) return;
-  mpSend({ type:'host_broadcast', target:name, payload:{ cmd:'warn', text } });
+function hdWarnPlayer(id){
+  const p = mpPlayerById(id); if (!p) return;
+  const text = prompt('Message to send to ' + p.name + ':', 'Please stay on the game tab.');
+  if (text === null) return;
+  mpSend({ type:'host_broadcast', targetId:id, payload:{ cmd:'warn', text } });
 }
 
-function hdKickGroup(name){
-  if(!confirm('Remove "'+name+'" from the room?\n\nThey will be disconnected immediately.')) return;
-  const text=prompt('Reason (optional, shown to the student):','')||'';
-  mpSend({ type:'host_broadcast', target:name, payload:{ cmd:'kick', text } });
+function hdKickPlayer(id){
+  const p = mpPlayerById(id); if (!p) return;
+  if (!confirm('Remove ' + p.name + ' from the room?\n\nThey will be disconnected and cannot rejoin this room code.')) return;
+  const text = prompt('Reason (optional, shown to the student):', '') || '';
+  mpSend({ type:'host_broadcast', targetId:id, payload:{ cmd:'kick', text } });
+  if (MP.viewingId === id) mpCloseView();
 }
 
 /* =============================================
-   HOST: LIVE GAMEPLAY VIEW
+   HOST: LIVE VIEW OF ONE STUDENT
 ============================================= */
-function mpOpenView(name){
-  MP.viewingGroup=name;
+function mpOpenView(id){
+  MP.viewingId = id;
   mpRenderView();
   document.getElementById('mpViewModal').classList.add('show');
 }
 function mpCloseView(){
-  MP.viewingGroup=null;
+  MP.viewingId = null;
   document.getElementById('mpViewModal').classList.remove('show');
 }
 
 function mpRenderView(){
-  if(!MP.viewingGroup||!MP.lastInfo) return;
-  const g=MP.lastInfo.groups.find(x=>x.name===MP.viewingGroup);
-  const body=document.getElementById('mpvBody');
-  if(!g){
-    body.innerHTML='<p style="color:var(--dim);text-align:center;">This group is no longer connected.</p>';
-    return;
-  }
-  document.getElementById('mpvTitle').textContent='👁 '+g.name;
-  document.getElementById('mpvSub').textContent=
-    (g.members&&g.members.length)? g.members.join(', ') : 'Updates automatically';
+  if (!MP.viewingId) return;
+  const p = mpPlayerById(MP.viewingId);
+  const body = document.getElementById('mpvBody');
+  if (!p) { body.innerHTML = '<p style="color:var(--dim);text-align:center;">This student is no longer in the room.</p>'; return; }
 
-  const opened=g.opened||0, totalC=g.totalCases||0;
-  const pct=totalC>0?Math.round(opened/totalC*100):0;
-  const statusText={playing:'🎮 Playing',deal:'🤝 Deal made',done:'🏆 Finished',disconnected:'⚡ Disconnected'}[g.status]||'🎮 Playing';
+  document.getElementById('mpvTitle').textContent = '👁 ' + p.name;
+  document.getElementById('mpvSub').textContent = (MP.lastInfo.groupName || '') + ' · updates automatically';
 
-  body.innerHTML=`
+  const opened = p.opened||0, totalC = p.totalCases||0;
+  const pct = totalC > 0 ? Math.round(opened/totalC*100) : 0;
+  const st = MP_STATUS[p.status] || MP_STATUS.waiting;
+
+  body.innerHTML = `
     <div class="mpv-stat-grid">
-      <div class="mpv-stat"><span>STATUS</span><strong style="color:var(--blue)">${esc(statusText)}</strong></div>
-      <div class="mpv-stat"><span>ROUND</span><strong style="color:var(--gold)">${g.round||'—'}</strong></div>
+      <div class="mpv-stat"><span>STATUS</span><strong style="color:var(--blue)">${esc(st.short)}</strong></div>
+      <div class="mpv-stat"><span>ROUND</span><strong style="color:var(--gold)">${p.round||'—'}</strong></div>
       <div class="mpv-stat"><span>CASES OPENED</span><strong style="color:var(--gold)">${opened}${totalC?(' / '+totalC):''}</strong></div>
-      <div class="mpv-stat"><span>WRONG ANSWERS</span><strong style="color:var(--red)">${g.errors||0}</strong></div>
-      <div class="mpv-stat"><span>CURRENT OFFER</span><strong style="color:var(--green)">${esc(g.offer||'—')}</strong></div>
-      <div class="mpv-stat"><span>LEFT TAB</span><strong style="color:${(g.alerts||0)>0?'var(--red)':'var(--dim)'}">${g.alerts||0}×</strong></div>
+      <div class="mpv-stat"><span>WRONG ANSWERS</span><strong style="color:var(--red)">${p.errors||0}</strong></div>
+      <div class="mpv-stat"><span>CURRENT OFFER</span><strong style="color:var(--green)">${esc(p.offer||'—')}</strong></div>
+      <div class="mpv-stat"><span>LEFT TAB</span><strong style="color:${(p.alerts||0)>0?'var(--red)':'var(--dim)'}">${p.alerts||0}×</strong></div>
     </div>
-
     <div style="margin-top:16px;">
       <div style="font-size:0.7rem;color:var(--dim);margin-bottom:6px;">PROGRESS THROUGH THE GAME</div>
       <div class="hd-prog-wrap" style="height:14px;"><div class="hd-prog-bar" style="width:${pct}%"></div></div>
       <div style="font-size:0.72rem;color:var(--dim);margin-top:6px;text-align:right;">${pct}% complete</div>
     </div>
-
-    ${g.dealValue||g.finalValue ? `
+    ${p.dealValue||p.finalValue ? `
     <div class="mpv-stat-grid" style="margin-top:16px;">
-      ${g.dealValue?`<div class="mpv-stat"><span>DEAL VALUE</span><strong style="color:var(--green)">${esc(g.dealValue)}</strong></div>`:''}
-      ${g.finalValue?`<div class="mpv-stat"><span>FINAL VALUE</span><strong style="color:var(--gold)">${esc(g.finalValue)}</strong></div>`:''}
-      ${g.pts?`<div class="mpv-stat"><span>SCORE</span><strong style="color:var(--green)">${esc(g.pts)}</strong></div>`:''}
+      ${p.dealValue?`<div class="mpv-stat"><span>DEAL</span><strong style="color:var(--green)">${esc(p.dealValue)}</strong></div>`:''}
+      ${p.caseValue?`<div class="mpv-stat"><span>OWN CASE</span><strong style="color:var(--gold)">${esc(p.caseValue)}</strong></div>`:''}
+      ${p.finalValue?`<div class="mpv-stat"><span>FINAL VALUE</span><strong style="color:var(--gold)">${esc(p.finalValue)}</strong></div>`:''}
+      ${p.pts?`<div class="mpv-stat"><span>SCORE</span><strong style="color:var(--green)">${esc(p.pts)}</strong></div>`:''}
     </div>`:''}
-
     <div style="display:flex;gap:8px;margin-top:16px;flex-wrap:wrap;">
-      <button class="btn btn-blue" style="flex:1;font-size:0.75rem;padding:9px;" onclick="hdWarnGroup('${esc(g.name).replace(/'/g,"\\'")}')">⚠ WARN</button>
-      <button class="btn btn-blue" style="flex:1;font-size:0.75rem;padding:9px;opacity:0.85;" onclick="hdKickGroup('${esc(g.name).replace(/'/g,"\\'")}')">🚪 KICK</button>
+      <button class="btn btn-blue" style="flex:1;font-size:0.75rem;padding:9px;" onclick="hdWarnPlayer(${mpJsArg(p.id)})">⚠ WARN</button>
+      <button class="btn btn-blue" style="flex:1;font-size:0.75rem;padding:9px;opacity:0.85;" onclick="hdKickPlayer(${mpJsArg(p.id)})">🚪 KICK</button>
     </div>
   `;
 }
 
 /* =============================================
-   HOST: START ALL — now sends the case/question setup too
+   HOST: START — sends the case/question setup to every student
 ============================================= */
 function hdStartAllWithConfig(){
-  const cfg={
-    values: (MP.hostConfig&&MP.hostConfig.values)?MP.hostConfig.values:null,
-    questions: (GS.questions&&GS.questions.length)?GS.questions:null
+  const players = (MP.lastInfo && MP.lastInfo.players) || [];
+  const inGame = players.filter(p => p.status === 'playing' || p.status === 'deal').length;
+  if (!players.length) {
+    if (!confirm('No students have joined yet.\n\nStart anyway? Students who join later will start automatically.')) return;
+  } else if (inGame > 0) {
+    if (!confirm(inGame + ' student(s) are still playing.\n\nStart a NEW game for everyone? Their current game will end.')) return;
+  }
+  const cfg = {
+    values: (MP.hostConfig && MP.hostConfig.values) ? MP.hostConfig.values : null,
+    questions: (GS.questions && GS.questions.length) ? GS.questions : null
   };
   mpSend({ type:'host_broadcast', payload:{ cmd:'start_game', config:cfg } });
 }
@@ -4243,23 +4577,33 @@ window.addEventListener('DOMContentLoaded', () => {
     mpBtn.textContent = mpIsOnline() ? '🔌 MULTIPLAYER (ONLINE)' : '🔌 MULTIPLAYER (LAN / HOTSPOT)';
     mpBtn.style.borderColor = '#00FFFF';
     mpBtn.style.color = '#00FFFF';
-    mpBtn.onclick = showMpModal;
+    mpBtn.onclick = () => showMpModal();
     btns.appendChild(mpBtn);
   }
-});
-
-// Auto-detect and pre-fill server IP on group pane open
-window.addEventListener('DOMContentLoaded', () => {
   const detected = mpDetectServerInfo();
   if (detected) {
     const el = document.getElementById('mpServerIp');
     if (el) el.value = detected;
   }
+
+  // FIX: Auto-join from a teacher-shared link, e.g. ?code=7K3P9Q
+  // (previously the URL parameter was never read at all — links just
+  // opened the plain homepage).
+  const joinCode = new URLSearchParams(location.search).get('code');
+  if (joinCode) {
+    mpSelectRole('player');
+    showMpModal(true);
+    setTimeout(() => {
+      const codeEl = document.getElementById('mpPlayerRoomId');
+      if (codeEl) codeEl.value = joinCode.toUpperCase().replace(/[^A-Z0-9]/g, '');
+      mpPlayerCheckCode();
+    }, 150);
+  }
 });
 </script>
 
 
-<div class="modal-ov" id="qSetupModal">
+<div class="modal-ov" id="qSetupModal" style="z-index:2500;">
   <div class="q-modal" style="max-width:750px;border-color:var(--green);box-shadow:0 0 60px rgba(57,255,20,0.25),0 25px 70px rgba(0,0,0,0.85);">
     <div style="text-align:center;margin-bottom:18px;">
       <div style="font-size:2.2rem">📝</div>
@@ -4479,6 +4823,57 @@ window.addEventListener('DOMContentLoaded', () => {
   .gf-icon{font-size:2rem;}
   .dnd-tab{font-size:0.66rem;padding:9px 13px;}
 }
+
+/* ===== v3 multiplayer: group picker, student steps, dashboard ===== */
+.mp-label{font-size:0.75rem;color:var(--dim);display:block;margin-bottom:5px;letter-spacing:1px;}
+.mp-help{font-size:0.7rem;color:var(--dim);margin-top:6px;line-height:1.5;}
+.mp-code-input{
+  width:100%;background:rgba(0,0,0,0.5);border:2px solid var(--gold);border-radius:8px;color:var(--gold);
+  font-family:var(--font-head);font-size:1.3rem;padding:12px;text-align:center;outline:none;letter-spacing:6px;
+}
+.mp-text-input{
+  width:100%;background:rgba(0,0,0,0.5);border:1px solid var(--border);border-radius:8px;color:var(--text);
+  font-family:var(--font-body);font-size:1rem;padding:10px;outline:none;
+}
+.mp-text-input:focus,.mp-code-input:focus{box-shadow:0 0 0 3px rgba(0,191,255,0.25);}
+.mp-select{
+  background:rgba(0,0,0,0.6);border:1px solid var(--blue);border-radius:8px;color:var(--text);
+  font-family:var(--font-body);font-size:0.9rem;padding:10px;outline:none;
+}
+.mp-select option{background:#0b1128;color:#fff;}
+.mp-group-box{
+  background:rgba(0,191,255,0.06);border:1px solid rgba(0,191,255,0.4);border-radius:10px;
+  padding:12px;margin-bottom:14px;
+}
+.mp-seg{display:flex;gap:6px;flex-wrap:wrap;}
+.mp-seg-btn{
+  flex:1;min-width:150px;padding:9px 6px;border-radius:7px;cursor:pointer;
+  font-family:var(--font-head);font-size:0.68rem;letter-spacing:1px;
+  border:2px solid var(--border);background:rgba(255,255,255,0.03);color:var(--dim);transition:all 0.2s;
+}
+.mp-seg-btn.active{border-color:var(--blue);background:rgba(0,191,255,0.16);color:var(--blue);}
+.mp-seg-btn.disabled{opacity:0.4;pointer-events:none;}
+.mp-steps{display:flex;gap:8px;justify-content:center;margin-bottom:14px;}
+.mp-steps span{
+  font-family:var(--font-head);font-size:0.62rem;letter-spacing:1px;color:var(--dim);
+  border:1px solid var(--border);border-radius:20px;padding:5px 12px;
+}
+.mp-steps span.on{color:var(--gold);border-color:var(--gold);background:rgba(255,215,0,0.1);}
+.mp-steps span.done{color:var(--green);border-color:rgba(57,255,20,0.5);}
+.mp-joined-group{
+  text-align:center;background:rgba(255,215,0,0.06);border:1px solid rgba(255,215,0,0.3);
+  border-radius:10px;padding:12px;margin-bottom:14px;
+}
+.hd-group-card.gc-waiting{border-color:rgba(255,255,255,0.18);}
+.hd-code-banner{
+  display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap;
+  background:rgba(0,0,0,0.45);border:1px solid rgba(255,215,0,0.25);border-radius:12px;
+  padding:12px 16px;margin-bottom:16px;
+}
+.hd-counts{display:flex;gap:18px;flex-wrap:wrap;}
+.hd-counts div{text-align:center;min-width:56px;}
+.hd-counts strong{display:block;font-family:var(--font-head);font-size:1.3rem;color:var(--green);}
+.hd-counts span{font-size:0.58rem;color:var(--dim);letter-spacing:1px;}
 </style>
 </body>
 </html>
