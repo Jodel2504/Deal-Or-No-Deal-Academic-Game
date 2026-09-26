@@ -2196,31 +2196,35 @@ function playerDeal(){
 }
 
 function preFinalizeAndReveal(){
-  // Pre-assign the 2 remaining dashboard values to the 2 remaining cases RIGHT NOW.
+  // FIX: Randomly assign ALL remaining dashboard values across ALL remaining
+  // unopened cases (not just "slot[0] → first other case, slot[1] → chosen").
+  // The old code always put the cheapest value in the chosen case when the
+  // player dealt early, which caused the wrong value to appear in the reveal.
   const total=GS.totalCases||30;
-  const remaining=GS.dashValues.map((v,j)=>({j,v})).filter(s=>!GS.dashUsed[s.j]);
 
-  // Find the other unopened non-chosen case
-  let otherCase=-1;
+  // All dashboard values not yet consumed — shuffle them randomly
+  const pool=GS.dashValues.map((v,j)=>({j,v})).filter(s=>!GS.dashUsed[s.j]);
+  for(let i=pool.length-1;i>0;i--){
+    const r=Math.floor(Math.random()*(i+1));
+    [pool[i],pool[r]]=[pool[r],pool[i]];
+  }
+
+  // Collect every case that still needs a value assigned (chosen case last)
+  const needsValue=[];
   for(let i=0;i<total;i++){
-    if(!GS.openedCases.includes(i)&&i!==GS.chosenCase){
-      otherCase=i; break;
+    if(!GS.openedCases.includes(i)&&i!==GS.chosenCase&&GS.caseRevealedValue[i]==null){
+      needsValue.push(i);
     }
   }
+  if(GS.caseRevealedValue[GS.chosenCase]==null) needsValue.push(GS.chosenCase);
 
-  // Assign: slot[0]→other case, slot[1]→player case
-  if(otherCase>=0&&remaining.length>=1){
-    if(GS.caseRevealedValue[otherCase]==null){
-      GS.caseRevealedValue[otherCase]=remaining[0].v;
-    }
-  }
-  if(remaining.length>=2&&GS.caseRevealedValue[GS.chosenCase]==null){
-    GS.caseRevealedValue[GS.chosenCase]=remaining[1].v;
-  } else if(remaining.length===1&&GS.caseRevealedValue[GS.chosenCase]==null){
-    GS.caseRevealedValue[GS.chosenCase]=remaining[0].v;
-  }
+  // Assign one shuffled value per case; mark dashboard slot as used
+  needsValue.forEach((ci,idx)=>{
+    if(idx>=pool.length) return;
+    GS.caseRevealedValue[ci]=pool[idx].v;
+    GS.dashUsed[pool[idx].j]=true;
+  });
 
-  // Now proceed to final reveal
   startFinalReveal();
 }
 function playerNoDeal(){
@@ -2255,10 +2259,15 @@ function advanceRound(){
 function startFinalPhase(){
   stopBg();
 
-  // Pre-assign the 2 remaining dashboard values to the 2 remaining cases RIGHT NOW.
-  // This must happen before the banker offer so the values are locked in.
+  // FIX: Randomly assign the 2 remaining dashboard values to the 2 remaining
+  // cases so neither case deterministically gets the "cheaper" value.
   const total=GS.totalCases||30;
-  const remaining=GS.dashValues.map((v,j)=>({j,v})).filter(s=>!GS.dashUsed[s.j]);
+  const pool=GS.dashValues.map((v,j)=>({j,v})).filter(s=>!GS.dashUsed[s.j]);
+  // Shuffle pool
+  for(let i=pool.length-1;i>0;i--){
+    const r=Math.floor(Math.random()*(i+1));
+    [pool[i],pool[r]]=[pool[r],pool[i]];
+  }
 
   // Find the other unopened non-chosen case
   let otherCase=-1;
@@ -2268,16 +2277,19 @@ function startFinalPhase(){
     }
   }
 
-  // Assign: slot[0]→other case, slot[1]→player case
-  if(otherCase>=0&&remaining.length>=1){
+  // Assign randomly: pool[0]→other case, pool[1]→chosen case
+  if(otherCase>=0&&pool.length>=1){
     if(GS.caseRevealedValue[otherCase]==null){
-      GS.caseRevealedValue[otherCase]=remaining[0].v;
+      GS.caseRevealedValue[otherCase]=pool[0].v;
+      GS.dashUsed[pool[0].j]=true;
     }
   }
-  if(remaining.length>=2&&GS.caseRevealedValue[GS.chosenCase]==null){
-    GS.caseRevealedValue[GS.chosenCase]=remaining[1].v;
-  } else if(remaining.length===1&&GS.caseRevealedValue[GS.chosenCase]==null){
-    GS.caseRevealedValue[GS.chosenCase]=remaining[0].v;
+  if(pool.length>=2&&GS.caseRevealedValue[GS.chosenCase]==null){
+    GS.caseRevealedValue[GS.chosenCase]=pool[1].v;
+    GS.dashUsed[pool[1].j]=true;
+  } else if(pool.length===1&&GS.caseRevealedValue[GS.chosenCase]==null){
+    GS.caseRevealedValue[GS.chosenCase]=pool[0].v;
+    GS.dashUsed[pool[0].j]=true;
   }
 
   // Show banker offer
@@ -3734,7 +3746,7 @@ const MP = {
   intentionalClose: false,
   reconnectTimer: null,
   statusBack: 'role',  // which pane the status "BACK" button returns to
-  wakeAttempts: 0,     // FIX: counts first-connect retries (Render free-tier cold start)
+  wakeAttempts: 0,     // FIX: retry counter for Render free-tier cold-start
 
   // host
   hostActive: false,
@@ -3796,7 +3808,7 @@ function mpConnect(ip, onOpen) {
   sock.onopen = () => {
     if (MP.ws !== sock) return;
     MP.connected = true;
-    MP.wakeAttempts = 0; // FIX: reset retry counter once we actually connect
+    MP.wakeAttempts = 0;
     clearTimeout(MP.reconnectTimer);
     if (onOpen) onOpen();
   };
@@ -3812,30 +3824,34 @@ function mpConnect(ip, onOpen) {
     MP.connected = false;
     mpUpdateBadge();
     if (MP.intentionalClose || !MP.serverIp) return;
-    // Only keep retrying if we were actually in a room
     if (MP.hostActive || MP.joined) {
+      // Already inside a room — keep retrying silently
       MP.reconnectTimer = setTimeout(() => mpConnect(MP.serverIp, mpResume), 3000);
       return;
     }
     if (!wasConnected) {
-      // FIX: On free hosts (e.g. Render) the server can be asleep and take up
-      // to ~50s to wake on the very first request. Previously this failed
-      // permanently on attempt #1 with no retry — that was the "can't join"
-      // bug. Now we retry a few times with an honest status message instead.
-      MP.wakeAttempts++;
+      // FIX: Render free-tier server sleeps after inactivity and can take up
+      // to ~50 s to wake on the first request.  Previously we gave up after
+      // one failed attempt and showed a permanent error — that was the
+      // "can't enter the room" bug. Now we retry up to 7 times (~50 s total)
+      // with an honest status message, then show the real error only if the
+      // server is still unreachable after all retries.
+      MP.wakeAttempts = (MP.wakeAttempts || 0) + 1;
       if (MP.wakeAttempts <= 7) {
         showMpModal(true);
-        showMpStatus('⏳', 'Connecting…',
+        showMpStatus('⏳',
+          MP.wakeAttempts === 1 ? 'Connecting…' : `Still connecting… (${MP.wakeAttempts}/7)`,
           MP.wakeAttempts === 1
-            ? 'If this is the first connection in a while, the server may need up to a minute to wake up.'
-            : 'Still trying (' + MP.wakeAttempts + '/7)… the server may be waking up from sleep.');
+            ? 'The server may be waking up — this can take up to a minute the first time.'
+            : 'Hang tight, the server is starting up.');
         MP.reconnectTimer = setTimeout(() => mpConnect(MP.serverIp, onOpen), 7000);
       } else {
         MP.wakeAttempts = 0;
         showMpModal(true);
         showMpStatus('❌', 'Could not reach the server',
-          mpIsOnline() ? 'Check the link your teacher shared and your internet connection, then try again.'
-                       : 'Make sure you are on the same Wi-Fi/hotspot as your teacher and the address is correct.');
+          mpIsOnline()
+            ? 'Check the link your teacher shared and your internet connection, then try again.'
+            : 'Make sure you are on the same Wi-Fi/hotspot as your teacher and the address is correct.');
       }
     }
   };
@@ -4191,6 +4207,10 @@ function mpHandleHostMessage(payload) {
 
     document.getElementById('playerName').value = MP.playerName || 'Student';
     if (cfg && Array.isArray(cfg.questions) && cfg.questions.length) GS.questions = cfg.questions;
+    // FIX: apply timer settings broadcast from host (previously these were
+    // never sent so timerEnabled was always false in multiplayer)
+    if (cfg && cfg.timerEnabled !== undefined) GS.timerEnabled = !!cfg.timerEnabled;
+    if (cfg && typeof cfg.timerSeconds === 'number' && cfg.timerSeconds > 0) GS.timerSeconds = cfg.timerSeconds;
 
     MP.gameActive = true;
     MP.focusLeaves = 0;
@@ -4289,16 +4309,21 @@ function mpGenerateCode(){
 function mpCopyServerLink(){
   const detected=mpDetectServerInfo();
   if(!detected){ alert('Start the server first, then reopen this screen.'); return; }
-  const code=MP.roomId || (document.getElementById('mpHostRoomId').value||'').trim();
-  // FIX: embed the room code as ?code=XXXXXX so the link is a true one-click
-  // auto-join — students land straight in the waiting room and just type
-  // their name, instead of landing on the plain homepage.
-  const link=location.protocol+'//'+detected+'/'+(code ? ('?code='+encodeURIComponent(code)) : '');
-  const text=code ? (link+'\n\nOr give them the code by hand: '+code) : link;
+  const code=(MP.roomId||(document.getElementById('mpHostRoomId').value||'')).trim();
+  const base=location.protocol+'//'+detected+'/';
+  // FIX: embed the room code as ?code=XXXXXX so the shared link is a true
+  // one-click auto-join — students land straight in the name-entry waiting
+  // room instead of the main menu.
+  const link=code ? base+'?code='+encodeURIComponent(code) : base;
+  const text=code
+    ? link+'\n\nOr share the code by hand: '+code
+    : link;
   if(navigator.clipboard&&navigator.clipboard.writeText){
-    navigator.clipboard.writeText(text).then(()=>alert('✅ Copied! Students who open this link join automatically:\n\n'+text),()=>prompt('Copy this:',text));
+    navigator.clipboard.writeText(text)
+      .then(()=>alert('✅ Copied! Students who open this link join automatically:\n\n'+text),
+            ()=>prompt('Copy this link:',text));
   }else{
-    prompt('Copy this:',text);
+    prompt('Copy this link:',text);
   }
 }
 
@@ -4563,7 +4588,10 @@ function hdStartAllWithConfig(){
   }
   const cfg = {
     values: (MP.hostConfig && MP.hostConfig.values) ? MP.hostConfig.values : null,
-    questions: (GS.questions && GS.questions.length) ? GS.questions : null
+    questions: (GS.questions && GS.questions.length) ? GS.questions : null,
+    // FIX: send timer settings so multiplayer students use the same timer
+    timerEnabled: GS.timerEnabled || false,
+    timerSeconds: GS.timerSeconds || 30
   };
   mpSend({ type:'host_broadcast', payload:{ cmd:'start_game', config:cfg } });
 }
@@ -4586,18 +4614,21 @@ window.addEventListener('DOMContentLoaded', () => {
     if (el) el.value = detected;
   }
 
-  // FIX: Auto-join from a teacher-shared link, e.g. ?code=7K3P9Q
-  // (previously the URL parameter was never read at all — links just
-  // opened the plain homepage).
+  // FIX: Auto-join from a teacher-shared link that contains ?code=XXXXXX.
+  // Previously the URL parameter was never read, so links just opened the
+  // plain homepage and students had to navigate manually (5-8 extra clicks).
   const joinCode = new URLSearchParams(location.search).get('code');
   if (joinCode) {
-    mpSelectRole('player');
-    showMpModal(true);
+    // Let the page finish rendering before we start navigating
     setTimeout(() => {
-      const codeEl = document.getElementById('mpPlayerRoomId');
-      if (codeEl) codeEl.value = joinCode.toUpperCase().replace(/[^A-Z0-9]/g, '');
-      mpPlayerCheckCode();
-    }, 150);
+      mpSelectRole('player');
+      showMpModal(true);
+      setTimeout(() => {
+        const codeEl = document.getElementById('mpPlayerRoomId');
+        if (codeEl) codeEl.value = joinCode.toUpperCase().replace(/[^A-Z0-9]/g, '');
+        mpPlayerCheckCode();
+      }, 200);
+    }, 300);
   }
 });
 </script>
